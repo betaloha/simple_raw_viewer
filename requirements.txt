@@ -3,3 +3,5 @@ rawpy
 Pillow
 numpy
 imageio
+PyOpenGL
+exifread

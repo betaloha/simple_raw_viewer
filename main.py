@@ -7,12 +7,16 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QSlider, QComboBox, QCheckBox, QGraphicsView, 
                              QGraphicsScene, QGraphicsPixmapItem, QMessageBox,
-                             QDialog, QFormLayout)
+                             QDialog, QFormLayout, QStackedWidget)
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QPixmap, QImage
 import rawpy
 import numpy as np
 from PIL import Image, ImageCms
+from OpenGL.GL import *
+from OpenGL.GL import shaders
+import exifread
 
 def get_x11_icc_profile():
     try:
@@ -72,6 +76,147 @@ class ImageGraphicsView(QGraphicsView):
 
         self.scale(zoom_factor, zoom_factor)
 
+class GLImageView(QOpenGLWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.image_data = None
+        self.img_width = 0
+        self.img_height = 0
+        
+        self.exposure = 1.0
+        self.gamma = 2.22
+        
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.last_pos = None
+
+    def initializeGL(self):
+        self.shader_program = shaders.compileProgram(
+            shaders.compileShader("""
+                #version 330 core
+                layout (location = 0) in vec2 aPos;
+                layout (location = 1) in vec2 aTexCoord;
+                out vec2 TexCoord;
+                uniform mat4 transform;
+                void main() {
+                    gl_Position = transform * vec4(aPos, 0.0, 1.0);
+                    TexCoord = aTexCoord;
+                }
+            """, GL_VERTEX_SHADER),
+            shaders.compileShader("""
+                #version 330 core
+                out vec4 FragColor;
+                in vec2 TexCoord;
+                uniform sampler2D ourTexture;
+                uniform float exposure;
+                uniform float gamma;
+                void main() {
+                    vec4 texColor = texture(ourTexture, TexCoord);
+                    vec3 color = texColor.rgb * exposure;
+                    color = clamp(color, 0.0, 1.0);
+                    color = pow(color, vec3(1.0 / gamma));
+                    FragColor = vec4(color, 1.0);
+                }
+            """, GL_FRAGMENT_SHADER)
+        )
+        
+        vertices = np.array([
+             1.0,  1.0,   1.0, 0.0,
+             1.0, -1.0,   1.0, 1.0,
+            -1.0, -1.0,   0.0, 1.0,
+            -1.0,  1.0,   0.0, 0.0 
+        ], dtype=np.float32)
+        
+        indices = np.array([0, 1, 3, 1, 2, 3], dtype=np.uint32)
+        
+        self.VAO = glGenVertexArrays(1)
+        self.VBO = glGenBuffers(1)
+        self.EBO = glGenBuffers(1)
+        
+        glBindVertexArray(self.VAO)
+        glBindBuffer(GL_ARRAY_BUFFER, self.VBO)
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.EBO)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
+        
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * 4, ctypes.c_void_p(2 * 4))
+        glEnableVertexAttribArray(1)
+        
+        self.texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, self.texture)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        
+    def set_image(self, data, w, h):
+        self.image_data = data
+        self.img_width = w
+        self.img_height = h
+        self.makeCurrent()
+        glBindTexture(GL_TEXTURE_2D, self.texture)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16, w, h, 0, GL_RGB, GL_UNSIGNED_SHORT, data)
+        self.update()
+        
+    def paintGL(self):
+        glClearColor(0.2, 0.2, 0.2, 1.0)
+        glClear(GL_COLOR_BUFFER_BIT)
+        if self.image_data is None: return
+        glUseProgram(self.shader_program)
+        glUniform1f(glGetUniformLocation(self.shader_program, "exposure"), self.exposure)
+        glUniform1f(glGetUniformLocation(self.shader_program, "gamma"), self.gamma)
+        
+        widget_ar = self.width() / self.height() if self.height() > 0 else 1.0
+        img_ar = self.img_width / self.img_height if self.img_height > 0 else 1.0
+        
+        scale_x = self.zoom
+        scale_y = self.zoom
+        if widget_ar > img_ar: scale_x *= img_ar / widget_ar
+        else: scale_y *= widget_ar / img_ar
+            
+        transform = np.array([
+            [scale_x, 0.0, 0.0, 0.0],
+            [0.0, scale_y, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [self.pan_x, -self.pan_y, 0.0, 1.0]
+        ], dtype=np.float32)
+        glUniformMatrix4fv(glGetUniformLocation(self.shader_program, "transform"), 1, GL_FALSE, transform)
+        
+        glBindVertexArray(self.VAO)
+        glBindTexture(GL_TEXTURE_2D, self.texture)
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, None)
+        
+    def wheelEvent(self, event):
+        zoom_factor = 1.15
+        if event.angleDelta().y() > 0: self.zoom *= zoom_factor
+        else: self.zoom /= zoom_factor
+        self.update()
+        
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton: self.last_pos = event.pos()
+            
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton and self.last_pos:
+            dx = event.pos().x() - self.last_pos.x()
+            dy = event.pos().y() - self.last_pos.y()
+            self.pan_x += (dx / self.width()) * 2.0
+            self.pan_y += (dy / self.height()) * 2.0
+            self.last_pos = event.pos()
+            self.update()
+            
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton: self.last_pos = None
+
+    def fit_in_view(self):
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.update()
+
 class SettingsDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
@@ -85,7 +230,8 @@ class SettingsDialog(QDialog):
         self.cmb_mode.addItems([
             "Full rawpy processing (Slow)", 
             "Linear Cache Math (Medium)", 
-            "LUT Optimization (Fast)"
+            "LUT Optimization (Fast)",
+            "OpenGL GPU Shader (Ultra Fast)"
         ])
         self.cmb_mode.setCurrentIndex(parent.processing_mode)
         layout.addRow("Processing Mode:", self.cmb_mode)
@@ -121,7 +267,7 @@ class RawEditor(QMainWindow):
         self.processed_rgb = None
         self.target_icc_path = None
         
-        self.processing_mode = 2 # Default to LUT Optimization
+        self.processing_mode = 3 # Default to GPU Shader Optimization
         self.linear_cache = None
         self.cache_dirty = True
         self.is_first_load = False
@@ -146,13 +292,23 @@ class RawEditor(QMainWindow):
         
         main_layout = QHBoxLayout(central_widget)
         
-        # Left Panel - Image View
+        # View container
+        self.stack = QStackedWidget()
+        
+        # Left Panel - CPU Image View
         self.view = ImageGraphicsView()
         self.scene = QGraphicsScene()
         self.view.setScene(self.scene)
         self.pixmap_item = QGraphicsPixmapItem()
         self.scene.addItem(self.pixmap_item)
-        main_layout.addWidget(self.view, stretch=3)
+        
+        # Left Panel - GPU Image View
+        self.gl_view = GLImageView()
+        
+        self.stack.addWidget(self.view)
+        self.stack.addWidget(self.gl_view)
+        
+        main_layout.addWidget(self.stack, stretch=3)
         
         # Right Panel - Controls
         control_layout = QVBoxLayout()
@@ -182,7 +338,7 @@ class RawEditor(QMainWindow):
         self.lbl_gamma = QLabel("Gamma: 2.22")
         control_layout.addWidget(self.lbl_gamma)
         self.slider_gamma = QSlider(Qt.Orientation.Horizontal)
-        self.slider_gamma.setMinimum(10) # 0.1
+        self.slider_gamma.setMinimum(100) # 0.1
         self.slider_gamma.setMaximum(500) # 5.0
         self.slider_gamma.setValue(222) # 2.22
         self.slider_gamma.valueChanged.connect(self.on_gamma_changed)
@@ -230,6 +386,25 @@ class RawEditor(QMainWindow):
                 if self.raw_image is not None:
                     self.raw_image.close()
                 self.raw_image = rawpy.imread(self.raw_path)
+                
+                color_space = "sRGB"
+                if os.path.basename(self.raw_path).startswith('_'):
+                    color_space = "Adobe RGB"
+                else:
+                    try:
+                        with open(self.raw_path, 'rb') as f:
+                            tags = exifread.process_file(f, details=False)
+                            if 'EXIF ColorSpace' in tags:
+                                val = str(tags['EXIF ColorSpace'])
+                                if 'Uncalibrated' in val or '65535' in val or 'Adobe' in val or '2' in val:
+                                    color_space = "Adobe RGB"
+                    except Exception:
+                        pass
+                
+                self.cmb_colorspace.blockSignals(True)
+                self.cmb_colorspace.setCurrentText(color_space)
+                self.cmb_colorspace.blockSignals(False)
+                
                 self.cache_dirty = True
                 self.is_first_load = True
                 self.request_update_image()
@@ -278,19 +453,27 @@ class RawEditor(QMainWindow):
     def update_image_deferred(self):
         if self.raw_image is None:
             return
-        self.timer.start(100) # 100ms debounce
+        if self.processing_mode == 3:
+            # GPU Mode can update instantly without debounce lag
+            self.request_update_image()
+        else:
+            self.timer.start(100) # 100ms debounce for CPU modes
 
     def request_update_image(self):
         if self.raw_image is None:
             return
         
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        # Don't show wait cursor for instant GPU shader updates
+        if self.processing_mode != 3:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            
         try:
             self.process_and_display()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to process image: {str(e)}")
         finally:
-            QApplication.restoreOverrideCursor()
+            if self.processing_mode != 3:
+                QApplication.restoreOverrideCursor()
 
     def get_display_profile(self):
         if self.custom_profile_path:
@@ -318,6 +501,40 @@ class RawEditor(QMainWindow):
             out_cs = rawpy.ColorSpace.ProPhoto
             
         half_size = self.chk_fast_preview.isChecked()
+        
+        # === GPU Shader Mode ===
+        if self.processing_mode == 3:
+            self.stack.setCurrentWidget(self.gl_view)
+            
+            if self.cache_dirty or self.linear_cache is None:
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                self.linear_cache = self.raw_image.postprocess(
+                    use_camera_wb=use_camera_wb,
+                    use_auto_wb=use_auto_wb,
+                    half_size=half_size,
+                    output_color=out_cs,
+                    output_bps=16,
+                    gamma=(1, 1),
+                    no_auto_bright=False
+                )
+                self.cache_dirty = False
+                h, w, _ = self.linear_cache.shape
+                self.gl_view.set_image(self.linear_cache, w, h)
+                QApplication.restoreOverrideCursor()
+                
+            if self.is_first_load:
+                self.gl_view.fit_in_view()
+                self.is_first_load = False
+                
+            self.gl_view.exposure = exposure_multiplier
+            self.gl_view.gamma = gamma_val
+            self.gl_view.update()
+            
+            self.target_icc_path = self.system_icc_paths.get(cs_text)
+            return
+
+        # === CPU Modes ===
+        self.stack.setCurrentWidget(self.view)
         
         if self.processing_mode == 0:
             # Full rawpy processing (Slow)
@@ -446,10 +663,10 @@ class RawEditor(QMainWindow):
                 
             if icc_bytes:
                 img.save(file_name, icc_profile=icc_bytes)
+                QMessageBox.information(self, "Success", f"Image successfully exported to:\n{file_name}")
             else:
                 img.save(file_name)
-                
-            QMessageBox.information(self, "Success", f"Image successfully exported to:\n{file_name}")
+                QMessageBox.warning(self, "Warning", f"Image exported to:\n{file_name}\n\nWarning: Missing system ICC profile. No color profile was embedded!")
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to export image: {str(e)}")
