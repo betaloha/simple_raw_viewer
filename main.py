@@ -3,6 +3,7 @@ import os
 import subprocess
 import io
 import time
+import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QSlider, QComboBox, QCheckBox, QGraphicsView, 
@@ -128,19 +129,17 @@ class GLImageView(QOpenGLWidget):
                     for(int i=0; i<3; i++) {
                         float x = color[i];
                         
-                        // Use smoothstep-based bell curves for natural transitions
-                        float b_w = smoothstep(0.5, 0.0, x);
-                        float s_w = smoothstep(0.0, 0.4, x) * smoothstep(0.8, 0.4, x);
-                        float h_w = smoothstep(0.2, 0.6, x) * smoothstep(1.0, 0.6, x);
-                        float w_w = smoothstep(0.5, 1.0, x);
+                        // Unified Smooth Tonal Blending
+                        // Centers: Blacks(0.0), Shadows(0.33), Highlights(0.66), Whites(1.0)
+                        float b_w = exp(-pow(x / 0.4, 2.0));
+                        float s_w = exp(-pow((x - 0.33) / 0.4, 2.0));
+                        float h_w = exp(-pow((x - 0.66) / 0.4, 2.0));
+                        float w_w = exp(-pow((x - 1.0) / 0.4, 2.0));
                         
-                        // Apply adjustments with smoother weighting
-                        x += blacks * b_w * 0.05;
-                        x *= (1.0 + shadows * s_w * 0.5);
-                        x *= (1.0 + highlights * h_w * 0.5);
-                        x += whites * w_w * 0.05;
+                        float total_shift = (blacks * b_w) + (shadows * s_w) + (highlights * h_w) + (whites * w_w);
                         
-                        color[i] = clamp(x, 0.0, 1.0);
+                        // Apply single unified power shift
+                        color[i] = pow(clamp(x, 0.00001, 1.0), pow(2.0, -total_shift * 1.5));
                     }
                     
                     // Saturation
@@ -427,7 +426,250 @@ def process_thumbnail_task(file_path, index):
         pass
     return (index, None)
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
+import threading
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None
+
+# ---------------------------------------------------------------------------
+# Top-level helpers for multiprocessing (must be picklable, i.e. not methods)
+# ---------------------------------------------------------------------------
+def _kelvin_to_rgb_pure(kelvin):
+    """Pure-function version of kelvin_to_rgb for use in worker processes."""
+    import math, numpy as np
+    temp = kelvin / 100.0
+    if temp <= 66:
+        r = 255
+        g = 99.4708025861 * math.log(temp) - 161.1195681661
+        b = 0 if temp <= 19 else 138.5177312231 * math.log(temp - 10) - 305.0447927307
+    else:
+        r = 329.698727446 * math.pow(temp - 60, -0.1332047592)
+        g = 288.1221695283 * math.pow(temp - 60, -0.0755148492)
+        b = 255
+    return float(np.clip(r, 0, 255)), float(np.clip(g, 0, 255)), float(np.clip(b, 0, 255))
+
+
+def _batch_export_task(args):
+    """
+    Top-level (picklable) export function executed in a worker process.
+    args = (file_path, settings, out_path, pil_fmt, system_icc_paths)
+    Returns (basename, error_str_or_None)
+    """
+    import rawpy as _rawpy
+    import numpy as np
+    from PIL import Image, ImageCms
+    import os
+
+    file_path, settings, out_path, pil_fmt, system_icc_paths = args
+    basename = os.path.basename(file_path)
+    try:
+        ev                 = settings['exposure'] / 6.0
+        exposure_mult      = 2.0 ** ev
+        gamma_val          = settings['gamma'] / 100.0
+        use_camera_wb      = settings['wb'] == 'Camera'
+        use_auto_wb        = settings['wb'] == 'Auto'
+        cs_text            = settings['colorspace']
+
+        if cs_text == 'sRGB':
+            out_cs = _rawpy.ColorSpace.sRGB
+        elif cs_text == 'Adobe RGB':
+            out_cs = _rawpy.ColorSpace.Adobe
+        else:
+            out_cs = _rawpy.ColorSpace.ProPhoto
+
+        with _rawpy.imread(file_path) as raw:
+            export_lin = raw.postprocess(
+                use_camera_wb=use_camera_wb,
+                use_auto_wb=use_auto_wb,
+                half_size=False,
+                exp_shift=exposure_mult,
+                gamma=(1, 1),
+                output_color=out_cs,
+                output_bps=16,
+                no_auto_bright=True,
+            )
+
+        # White balance
+        dt, dtint = settings['temp'], settings['tint']
+        r_ref, g_ref, b_ref = _kelvin_to_rgb_pure(6500)
+        r_off, g_off, b_off = _kelvin_to_rgb_pure(float(np.clip(6500 + dt, 2000, 12000)))
+        g_off *= (1.0 - dtint / 200.0)
+        wb = [r_ref / r_off, g_ref / g_off, b_ref / b_off]
+
+        arr = export_lin.astype(np.float32) / 65535.0
+        for ch in range(3):
+            arr[:, :, ch] *= wb[ch]
+        arr = np.clip(arr, 0.0, 1.0)
+
+        # Tonal adjustments (Gaussian power-curve, mirrors GPU shader)
+        b = settings['blacks']     / 100.0
+        s = settings['shadows']    / 100.0
+        h = settings['highlights'] / 100.0
+        w = settings['whites']     / 100.0
+        x = np.clip(arr, 1e-6, 1.0)
+        b_w = np.exp(-((x / 0.4) ** 2))
+        s_w = np.exp(-(((x - 0.33) / 0.4) ** 2))
+        h_w = np.exp(-(((x - 0.66) / 0.4) ** 2))
+        w_w = np.exp(-(((x - 1.0)  / 0.4) ** 2))
+        total_shift = b * b_w + s * s_w + h * h_w + w * w_w
+        arr = np.power(x, np.power(2.0, -total_shift * 1.5))
+
+        # Saturation
+        sat_mult = 1.0 + settings['saturation'] / 100.0
+        if sat_mult != 1.0:
+            luma = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+            for ch in range(3):
+                arr[:, :, ch] = luma + (arr[:, :, ch] - luma) * sat_mult
+            arr = np.clip(arr, 0.0, 1.0)
+
+        # Gamma + quantise
+        arr = np.power(np.clip(arr, 1e-6, 1.0), 1.0 / gamma_val) * 255.0
+        img = Image.fromarray(arr.astype(np.uint8))
+
+        # ICC profile
+        icc_bytes = None
+        icc_path  = system_icc_paths.get(cs_text)
+        if icc_path and os.path.exists(icc_path):
+            with open(icc_path, 'rb') as f:
+                icc_bytes = f.read()
+        elif cs_text == 'sRGB':
+            icc_bytes = ImageCms.createProfile('sRGB').tobytes()
+
+        save_kw = {'icc_profile': icc_bytes} if icc_bytes else {}
+        if pil_fmt == 'JPEG':
+            save_kw['quality']     = 95
+            save_kw['subsampling'] = 0
+        img.save(out_path, format=pil_fmt, **save_kw)
+        return (basename, None)
+    except Exception as exc:
+        return (basename, str(exc))
+
+
+class BatchExportSignals(QObject):
+    progress = pyqtSignal(int, int, int)   # (done, total, active_workers)
+    finished = pyqtSignal(list, list, int) # (skipped_list, failed_list, done_count)
+
+
+class BatchExportWorker(QRunnable):
+    def __init__(self, tasks, skipped, stop_event):
+        """
+        tasks      – list of arg-tuples for _batch_export_task
+        skipped    – list of basenames that had no saved settings
+        stop_event – threading.Event; set it to request cancellation
+        """
+        super().__init__()
+        self.tasks      = tasks
+        self.skipped    = skipped
+        self.stop_event = stop_event
+        self.signals    = BatchExportSignals()
+
+    def run(self):
+        import time
+        import collections
+
+        total      = len(self.tasks)
+        failed     = []
+        done       = 0
+        task_queue = list(self.tasks)   # tasks not yet submitted
+        active     = {}                 # future -> task
+        max_cap    = os.cpu_count()     # hard upper bound (all logical CPUs)
+        limit      = max(1, max_cap // 4)  # start at 25% of logical CPUs
+
+        MEM_PERCENT_LIMIT   = 75.0
+        MEM_WINDOW_SECS     = 6.0   # rolling window to observe peak memory
+        MEM_SAMPLE_INTERVAL = 0.25  # background sampler interval (seconds)
+        SCALE_DOWN_COOLDOWN = 2.0   # min seconds between consecutive scale-downs
+        SCALE_UP_COOLDOWN   = 5.0   # min seconds between consecutive scale-ups
+
+        # Deque of (timestamp, mem_percent) filled by the sampler thread
+        window_size = int(MEM_WINDOW_SECS / MEM_SAMPLE_INTERVAL) + 1
+        mem_window  = collections.deque(maxlen=window_size)
+        window_lock = threading.Lock()
+
+        # ── Background thread: sample memory every MEM_SAMPLE_INTERVAL seconds ──
+        _sampler_stop = threading.Event()
+
+        def _sampler():
+            while not _sampler_stop.is_set():
+                pct = _psutil.virtual_memory().percent if _psutil else 0.0
+                with window_lock:
+                    mem_window.append((time.monotonic(), pct))
+                time.sleep(MEM_SAMPLE_INTERVAL)
+
+        sampler_thread = threading.Thread(target=_sampler, daemon=True)
+        sampler_thread.start()
+
+        def _peak_mem():
+            """Return the worst (peak) memory % seen in the rolling window."""
+            if _psutil is None:
+                return 0.0
+            cutoff = time.monotonic() - MEM_WINDOW_SECS
+            with window_lock:
+                recent = [pct for ts, pct in mem_window if ts >= cutoff]
+            return max(recent) if recent else _psutil.virtual_memory().percent
+
+        # Initialise cooldown clocks so first adjustment can happen immediately
+        last_scale_down = time.monotonic() - SCALE_DOWN_COOLDOWN
+        last_scale_up   = time.monotonic() - SCALE_UP_COOLDOWN
+
+        try:
+            with ProcessPoolExecutor(max_workers=max_cap) as executor:
+                while (task_queue or active) and not self.stop_event.is_set():
+                    peak = _peak_mem()
+
+                    # --- Submit tasks up to the current concurrency limit ---
+                    while (task_queue and len(active) < limit
+                           and peak < MEM_PERCENT_LIMIT
+                           and not self.stop_event.is_set()):
+                        task   = task_queue.pop(0)
+                        future = executor.submit(_batch_export_task, task)
+                        active[future] = task
+
+                    if not active:
+                        # Nothing running yet; memory under pressure – wait briefly
+                        time.sleep(MEM_SAMPLE_INTERVAL)
+                        continue
+
+                    # --- Wait for at least one result (short timeout keeps loop alive) ---
+                    finished_set, _ = wait(active.keys(), timeout=0.5,
+                                           return_when=FIRST_COMPLETED)
+
+                    for future in finished_set:
+                        try:
+                            basename, err = future.result()
+                            if err:
+                                failed.append(f"{basename}: {err}")
+                        except Exception as exc:
+                            failed.append(str(exc))
+                        del active[future]
+                        done += 1
+                        self.signals.progress.emit(done, total, len(active))
+
+                    # --- Adjust concurrency ceiling using windowed peak + cooldowns ---
+                    now  = time.monotonic()
+                    peak = _peak_mem()   # refresh after waiting
+
+                    if peak >= MEM_PERCENT_LIMIT:
+                        if now - last_scale_down >= SCALE_DOWN_COOLDOWN:
+                            limit           = max(1, limit - 1)
+                            last_scale_down = now
+                    elif limit < max_cap:
+                        if now - last_scale_up >= SCALE_UP_COOLDOWN:
+                            limit         = min(max_cap, limit + 1)
+                            last_scale_up = now
+
+                # If cancelled, cancel any still-pending futures
+                if self.stop_event.is_set():
+                    for f in list(active.keys()):
+                        f.cancel()
+        finally:
+            _sampler_stop.set()
+            sampler_thread.join(timeout=1.0)
+
+        self.signals.finished.emit(self.skipped, failed, done)
+
 
 class ThumbnailManagerSignals(QObject):
     result = pyqtSignal(int, bytes)
@@ -440,7 +682,7 @@ class ThumbnailManager(QRunnable):
 
     def run(self):
         # We use a ProcessPoolExecutor to completely bypass the Python GIL
-        with ProcessPoolExecutor() as executor:
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
             futures = {executor.submit(process_thumbnail_task, path, i): i for i, path in enumerate(self.file_paths)}
             for future in as_completed(futures):
                 try:
@@ -466,6 +708,11 @@ class RawEditor(QMainWindow):
         self.linear_cache = None
         self.cache_dirty = True
         self.is_first_load = False
+        
+        # Per-image settings memory: maps file_path -> dict of slider/combo values
+        self.image_settings = {}
+        self.current_dir = None
+        self.SETTINGS_FILENAME = '.raweditor_settings.json'
         
         self.counts_r = None
         self.counts_g = None
@@ -533,7 +780,7 @@ class RawEditor(QMainWindow):
         btn_open.clicked.connect(self.open_directory)
         btn_grid.addWidget(btn_open, 0, 0)
 
-        btn_mimic = QPushButton("Auto-Match")
+        btn_mimic = QPushButton("Match-Camera")
         btn_mimic.clicked.connect(self.match_thumbnail)
         btn_grid.addWidget(btn_mimic, 0, 1)
 
@@ -669,9 +916,20 @@ class RawEditor(QMainWindow):
         
         # Export
         control_layout.addStretch()
+        export_btn_layout = QHBoxLayout()
         btn_export = QPushButton("Export Image")
         btn_export.clicked.connect(self.export_image)
-        control_layout.addWidget(btn_export)
+        export_btn_layout.addWidget(btn_export)
+        self.btn_export_all = QPushButton("Export All")
+        self.btn_export_all.setToolTip("Export all images in the directory with their saved settings")
+        self.btn_export_all.clicked.connect(self.export_all_images)
+        export_btn_layout.addWidget(self.btn_export_all)
+        self.btn_stop_export = QPushButton("Stop Export")
+        self.btn_stop_export.setToolTip("Cancel the running batch export")
+        self.btn_stop_export.setVisible(False)
+        self.btn_stop_export.clicked.connect(self._request_stop_export)
+        export_btn_layout.addWidget(self.btn_stop_export)
+        control_layout.addLayout(export_btn_layout)
         
         self.timer = QTimer()
         self.timer.setSingleShot(True)
@@ -681,6 +939,7 @@ class RawEditor(QMainWindow):
         self.filmstrip = QListWidget()
         self.filmstrip.setViewMode(QListWidget.ViewMode.IconMode)
         self.filmstrip.setIconSize(QSize(120, 80))
+        self.filmstrip.setGridSize(QSize(128, 110))
         self.filmstrip.setFlow(QListWidget.Flow.LeftToRight)
         self.filmstrip.setWrapping(False)
         self.filmstrip.setResizeMode(QListWidget.ResizeMode.Adjust)
@@ -689,6 +948,19 @@ class RawEditor(QMainWindow):
         self.filmstrip.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.filmstrip.itemClicked.connect(self.on_thumbnail_clicked)
         outer_layout.addWidget(self.filmstrip)
+
+        # Filmstrip footer: file count on the left, clear-settings button on the right
+        filmstrip_footer = QHBoxLayout()
+        self.lbl_file_count = QLabel("")
+        self.lbl_file_count.setStyleSheet("color: gray; font-size: 11px;")
+        filmstrip_footer.addWidget(self.lbl_file_count)
+        filmstrip_footer.addStretch()
+        self.btn_clear_settings = QPushButton("Clear All Saved Settings")
+        self.btn_clear_settings.setToolTip("Discard persisted adjustments for every image in the current directory")
+        self.btn_clear_settings.setEnabled(False)
+        self.btn_clear_settings.clicked.connect(self.clear_all_saved_settings)
+        filmstrip_footer.addWidget(self.btn_clear_settings)
+        outer_layout.addLayout(filmstrip_footer)
         
     def open_directory(self):
         dir_name = QFileDialog.getExistingDirectory(self, "Open Directory", "")
@@ -792,35 +1064,41 @@ class RawEditor(QMainWindow):
                 return t * t * (3.0 - 2.0 * t)
                 
             def eval_tonal(x, b, s, h, w, g):
-                bw = smoothstep(0.5, 0.0, x)
-                sw = smoothstep(0.0, 0.4, x) * smoothstep(0.8, 0.4, x)
-                hw = smoothstep(0.2, 0.6, x) * smoothstep(1.0, 0.6, x)
-                ww = smoothstep(0.5, 1.0, x)
-                y = np.copy(x)
-                y += b * bw * 0.05
-                y *= (1.0 + s * sw * 0.5)
-                y *= (1.0 + h * hw * 0.5)
-                y += w * ww * 0.05
-                y = np.clip(y, 1e-6, 1.0)
+                # Unified Smooth Tonal Blending weights (Gaussian-like)
+                b_w = np.exp(-((x / 0.4)**2))
+                s_w = np.exp(-(((x - 0.33) / 0.4)**2))
+                h_w = np.exp(-(((x - 0.66) / 0.4)**2))
+                w_w = np.exp(-(((x - 1.0) / 0.4)**2))
+                
+                total_shift = (b * b_w) + (s * s_w) + (h * h_w) + (w * w_w)
+                
+                y = np.clip(x, 1e-6, 1.0)
+                # Apply single unified power shift
+                y = np.power(y, np.power(2.0, -total_shift * 1.5))
+                
                 return np.power(y, 1.0 / g)
                 
             best_p = np.array([0.0, 0.0, 0.0, 0.0, 2.22]) # b, s, h, w, g
-            lr = 5.0
+            initial_lr = 5.0
             eps = 1e-4
-            for _ in range(100):
+            num_iters = 150
+            for i in range(num_iters):
                 curr = eval_tonal(src_p, *best_p)
                 err = curr - tgt_p
                 
+                # Dynamic learning rate decay for smoother convergence
+                lr = initial_lr * (1.0 - i / float(num_iters))
+                
                 grad = np.zeros(5)
-                for i in range(5):
+                for j in range(5):
                     p_up = best_p.copy()
-                    p_up[i] += eps
+                    p_up[j] += eps
                     curr_up = eval_tonal(src_p, *p_up)
                     dcurr_dp = (curr_up - curr) / eps
-                    grad[i] = np.sum(2 * err * dcurr_dp)
+                    grad[j] = np.sum(2 * err * dcurr_dp)
                     
                 best_p -= lr * grad
-                # Clip b, s, h, w to [-1, 1], and gamma to [1, 5]
+                # Clip parameters to valid ranges
                 best_p[:4] = np.clip(best_p[:4], -1.0, 1.0)
                 best_p[4] = np.clip(best_p[4], 1.0, 5.0)
 
@@ -841,26 +1119,33 @@ class RawEditor(QMainWindow):
     def load_directory(self, dir_name):
         self.filmstrip.clear()
         self.image_files = []
+        self.current_dir = dir_name
         valid_extensions = ('.cr2', '.cr3', '.nef', '.arw', '.dng', '.pef')
         try:
             for f in sorted(os.listdir(dir_name)):
                 if f.lower().endswith(valid_extensions):
                     full_path = os.path.join(dir_name, f)
                     self.image_files.append(full_path)
-                    
+
                     item = QListWidgetItem(f)
                     self.filmstrip.addItem(item)
-                    
-            if self.image_files:
-                # We no longer load the first image automatically to save time and prevent blocking.
-                # The user will click an image in the filmstrip to start editing.
-                pass
-                
+
+            # Load persisted settings for this directory
+            self.image_settings = self._load_settings_from_disk(dir_name)
+
+            total = len(self.image_files)
+            if total > 0:
+                self.lbl_file_count.setText(f"{total} file{'s' if total != 1 else ''} in directory")
+                self.btn_clear_settings.setEnabled(True)
+            else:
+                self.lbl_file_count.setText("No RAW files found")
+                self.btn_clear_settings.setEnabled(False)
+
             # Process thumbnails asynchronously using true multiprocessing
             self.thumbnail_manager = ThumbnailManager(self.image_files)
             self.thumbnail_manager.signals.result.connect(self.on_thumbnail_ready)
             self.thumbnail_pool.start(self.thumbnail_manager)
-                
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load directory: {str(e)}")
 
@@ -868,8 +1153,14 @@ class RawEditor(QMainWindow):
         if index < self.filmstrip.count():
             img = QImage()
             img.loadFromData(data)
+            base_pixmap = QPixmap.fromImage(img)
             item = self.filmstrip.item(index)
-            item.setIcon(QIcon(QPixmap.fromImage(img)))
+            # Store the raw thumbnail so we can re-badge it later
+            item.setData(Qt.ItemDataRole.UserRole, base_pixmap)
+            if index < len(self.image_files) and self._is_edited(self.image_files[index]):
+                item.setIcon(QIcon(self._make_badge_icon(base_pixmap)))
+            else:
+                item.setIcon(QIcon(base_pixmap))
 
     def on_thumbnail_clicked(self, item):
         row = self.filmstrip.row(item)
@@ -877,18 +1168,28 @@ class RawEditor(QMainWindow):
             self.load_image(self.image_files[row])
 
     def load_image(self, file_path):
+        # --- Save settings for the image we are leaving ---
+        if self.raw_path is not None:
+            self.image_settings[self.raw_path] = self._collect_settings()
+            self._save_settings_to_disk()
+            # Refresh the badge for the image we just left
+            if self.raw_path in self.image_files:
+                self._refresh_badge_for_index(self.image_files.index(self.raw_path))
+
         self.raw_path = file_path
         try:
             if self.raw_image is not None:
                 self.raw_image.close()
             self.raw_image = rawpy.imread(self.raw_path)
-            
-            color_space = self.get_default_colorspace(self.raw_path)
-            
-            self.cmb_colorspace.blockSignals(True)
-            self.cmb_colorspace.setCurrentText(color_space)
-            self.cmb_colorspace.blockSignals(False)
-            
+
+            # --- Restore or default settings for the new image ---
+            if file_path in self.image_settings:
+                self._apply_settings(self.image_settings[file_path])
+            else:
+                # Default colorspace via EXIF; all other controls to defaults
+                default_cs = self.get_default_colorspace(self.raw_path)
+                self._apply_settings(self._default_settings(default_cs))
+
             self.cache_dirty = True
             self.is_first_load = True
             self.request_update_image()
@@ -945,7 +1246,192 @@ class RawEditor(QMainWindow):
         self.on_wb_slider_changed() # Force labels and spin boxes update
         
         self.request_update_image()
-            
+
+    # ------------------------------------------------------------------
+    # Per-image settings helpers
+    # ------------------------------------------------------------------
+    def _default_settings(self, colorspace=None):
+        """Return a dict representing the application's default adjustments."""
+        return {
+            'wb':         'Camera',
+            'colorspace': colorspace or 'sRGB',
+            'exposure':   0,
+            'gamma':      222,
+            'blacks':     0,
+            'shadows':    0,
+            'highlights': 0,
+            'whites':     0,
+            'saturation': 0,
+            'temp':       0,
+            'tint':       0,
+        }
+
+    def _collect_settings(self):
+        """Snapshot every adjustable control into a plain dict."""
+        return {
+            'wb':         self.cmb_wb.currentText(),
+            'colorspace': self.cmb_colorspace.currentText(),
+            'exposure':   self.slider_exposure.value(),
+            'gamma':      self.slider_gamma.value(),
+            'blacks':     self.slider_blacks.value(),
+            'shadows':    self.slider_shadows.value(),
+            'highlights': self.slider_highlights.value(),
+            'whites':     self.slider_whites.value(),
+            'saturation': self.slider_saturation.value(),
+            'temp':       self.slider_temp.value(),
+            'tint':       self.slider_tint.value(),
+        }
+
+    def _apply_settings(self, s):
+        """Restore all controls from a settings dict without triggering extra redraws."""
+        # Block signals on combos to avoid double cache invalidation
+        self.cmb_wb.blockSignals(True)
+        self.cmb_colorspace.blockSignals(True)
+
+        self.cmb_wb.setCurrentText(s['wb'])
+        self.cmb_colorspace.setCurrentText(s['colorspace'])
+
+        self.cmb_wb.blockSignals(False)
+        self.cmb_colorspace.blockSignals(False)
+
+        # Sliders: let their valueChanged handlers run normally so labels update
+        self.slider_exposure.setValue(s['exposure'])
+        self.slider_gamma.setValue(s['gamma'])
+        self.slider_blacks.setValue(s['blacks'])
+        self.slider_shadows.setValue(s['shadows'])
+        self.slider_highlights.setValue(s['highlights'])
+        self.slider_whites.setValue(s['whites'])
+        self.slider_saturation.setValue(s['saturation'])
+        self.slider_temp.setValue(s['temp'])
+        self.slider_tint.setValue(s['tint'])
+        # Sync the spin boxes (slider handlers don't always update spins)
+        self.spin_temp.blockSignals(True)
+        self.spin_tint.blockSignals(True)
+        self.spin_temp.setValue(s['temp'])
+        self.spin_tint.setValue(s['tint'])
+        self.spin_temp.blockSignals(False)
+        self.spin_tint.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
+    def _settings_file_path(self, dir_name=None):
+        d = dir_name or self.current_dir
+        if not d:
+            return None
+        return os.path.join(d, self.SETTINGS_FILENAME)
+
+    def _load_settings_from_disk(self, dir_name):
+        path = self._settings_file_path(dir_name)
+        if path and os.path.isfile(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _save_settings_to_disk(self):
+        path = self._settings_file_path()
+        if not path:
+            return
+        try:
+            # Only write entries that differ from default (edited images)
+            to_save = {
+                k: v for k, v in self.image_settings.items()
+                if self._is_edited(k)
+            }
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(to_save, f, indent=2)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Badge helpers
+    # ------------------------------------------------------------------
+    def _is_edited(self, file_path):
+        """Return True if the stored settings for file_path differ from defaults."""
+        if file_path not in self.image_settings:
+            return False
+        stored = self.image_settings[file_path]
+        # Use the stored colorspace as the baseline (EXIF-detected default)
+        defaults = self._default_settings(stored.get('colorspace', 'sRGB'))
+        return stored != defaults
+
+    def _make_badge_icon(self, base_pixmap):
+        """Return a copy of base_pixmap with a small coloured edit-badge overlay."""
+        result = base_pixmap.copy()
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Badge background
+        badge_size = max(18, result.height() // 5)
+        margin = 4
+        bx = result.width() - badge_size - margin
+        by = margin
+        painter.setBrush(QColor(255, 165, 0, 220))   # orange
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(bx, by, badge_size, badge_size)
+        # Pencil glyph
+        painter.setPen(QColor(255, 255, 255))
+        font = painter.font()
+        font.setPixelSize(max(10, badge_size - 6))
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(bx, by, badge_size, badge_size,
+                         Qt.AlignmentFlag.AlignCenter, "✎")
+        painter.end()
+        return result
+
+    def _refresh_badge_for_index(self, index):
+        """Redraw the badge (or remove it) for a single filmstrip item."""
+        if index < 0 or index >= self.filmstrip.count():
+            return
+        item = self.filmstrip.item(index)
+        base_pixmap = item.data(Qt.ItemDataRole.UserRole)
+        if base_pixmap is None:
+            return   # thumbnail not yet loaded
+        if index < len(self.image_files) and self._is_edited(self.image_files[index]):
+            item.setIcon(QIcon(self._make_badge_icon(base_pixmap)))
+        else:
+            item.setIcon(QIcon(base_pixmap))
+
+    def _refresh_all_badges(self):
+        for i in range(self.filmstrip.count()):
+            self._refresh_badge_for_index(i)
+
+    # ------------------------------------------------------------------
+    # Clear all saved settings
+    # ------------------------------------------------------------------
+    def clear_all_saved_settings(self):
+        reply = QMessageBox.question(
+            self, "Clear All Saved Settings",
+            "This will permanently discard saved adjustments for every image "
+            "in the current directory. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.image_settings.clear()
+
+        # Delete the JSON sidecar on disk
+        path = self._settings_file_path()
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+        # Remove all badges from thumbnails
+        self._refresh_all_badges()
+
+        # If an image is currently open, revert it to defaults
+        if self.raw_path:
+            default_cs = self.get_default_colorspace(self.raw_path)
+            self._apply_settings(self._default_settings(default_cs))
+            self.cache_dirty = True
+            self.request_update_image()
+
     def open_settings(self):
         old_mode = self.processing_mode
         old_profile = self.custom_profile_path
@@ -1135,30 +1621,23 @@ class RawEditor(QMainWindow):
         return ImageCms.createProfile("sRGB")
 
     def apply_tonal_math(self, arr):
-        # Localized tonal math for CPU paths
-        blacks = self.blacks
-        shadows = self.shadows
-        highlights = self.highlights
-        whites = self.whites
-        
-        res = arr.copy()
-        
-        # Helper for smoothstep-like behavior in numpy
-        def n_smoothstep(edge0, edge1, x):
-            t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
-            return t * t * (3.0 - 2.0 * t)
+        """Apply unified Gaussian power-curve tonal adjustments — mirrors the GPU shader exactly."""
+        b = self.blacks
+        s = self.shadows
+        h = self.highlights
+        w = self.whites
+        return self._apply_tonal_math_with(arr, b, s, h, w)
 
-        b_w = n_smoothstep(0.5, 0.0, res)
-        s_w = n_smoothstep(0.0, 0.4, res) * n_smoothstep(0.8, 0.4, res)
-        h_w = n_smoothstep(0.2, 0.6, res) * n_smoothstep(1.0, 0.6, res)
-        w_w = n_smoothstep(0.5, 1.0, res)
-        
-        res += blacks * b_w * 0.05
-        res *= (1.0 + shadows * s_w * 0.5)
-        res *= (1.0 + highlights * h_w * 0.5)
-        res += whites * w_w * 0.05
-        
-        return np.clip(res, 0.0, 1.0)
+    @staticmethod
+    def _apply_tonal_math_with(arr, b, s, h, w):
+        """Stateless version of tonal math for use in batch export."""
+        x = np.clip(arr, 1e-6, 1.0)
+        b_w = np.exp(-((x / 0.4) ** 2))
+        s_w = np.exp(-(((x - 0.33) / 0.4) ** 2))
+        h_w = np.exp(-(((x - 0.66) / 0.4) ** 2))
+        w_w = np.exp(-(((x - 1.0) / 0.4) ** 2))
+        total_shift = (b * b_w) + (s * s_w) + (h * h_w) + (w * w_w)
+        return np.power(x, np.power(2.0, -total_shift * 1.5))
 
     def apply_saturation(self, arr, sat_mult):
         if sat_mult == 1.0:
@@ -1454,6 +1933,101 @@ class RawEditor(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to export image: {str(e)}")
         finally:
             QApplication.restoreOverrideCursor()
+    def export_all_images(self):
+        """Batch-export all images using ProcessPoolExecutor — UI stays responsive."""
+        if not self.image_files:
+            QMessageBox.warning(self, "Export All", "No directory is open.")
+            return
+
+        # Save the current image's settings before exporting
+        if self.raw_path is not None:
+            self.image_settings[self.raw_path] = self._collect_settings()
+            self._save_settings_to_disk()
+
+        # Format picker dialog
+        from PyQt6.QtWidgets import QDialogButtonBox as _DBB
+        fmt_dlg = QDialog(self)
+        fmt_dlg.setWindowTitle("Export All — Options")
+        vbox = QVBoxLayout(fmt_dlg)
+        vbox.addWidget(QLabel("Export format:"))
+        fmt_combo = QComboBox()
+        fmt_combo.addItems(["JPEG", "TIFF", "PNG"])
+        vbox.addWidget(fmt_combo)
+        btns = _DBB(_DBB.StandardButton.Ok | _DBB.StandardButton.Cancel)
+        btns.accepted.connect(fmt_dlg.accept)
+        btns.rejected.connect(fmt_dlg.reject)
+        vbox.addWidget(btns)
+        if fmt_dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        fmt_map = {"JPEG": ("jpg", "JPEG"), "TIFF": ("tif", "TIFF"), "PNG": ("png", "PNG")}
+        ext, pil_fmt = fmt_map[fmt_combo.currentText()]
+
+        out_dir = QFileDialog.getExistingDirectory(self, "Select Output Folder", self.current_dir or "")
+        if not out_dir:
+            return
+
+        # Build task list
+        tasks   = []
+        skipped = []
+        for file_path in self.image_files:
+            if file_path in self.image_settings:
+                s = self.image_settings[file_path]
+            else:
+                s = self._default_settings(self.get_default_colorspace(file_path))
+                skipped.append(os.path.basename(file_path))
+            out_path = os.path.join(
+                out_dir,
+                os.path.splitext(os.path.basename(file_path))[0] + "." + ext
+            )
+            tasks.append((file_path, s, out_path, pil_fmt, self.system_icc_paths))
+
+        total = len(tasks)
+
+        # Show Stop button, hide Export All, show live progress
+        self._export_stop_event = threading.Event()
+        self.btn_export_all.setVisible(False)
+        self.btn_stop_export.setVisible(True)
+        self.lbl_file_count.setText(f"Exporting 0 / {total}…")
+
+        worker = BatchExportWorker(tasks, skipped, self._export_stop_event)
+        worker.signals.progress.connect(self._on_export_progress)
+        worker.signals.finished.connect(
+            lambda sk, fa, dn: self._on_export_finished(sk, fa, dn, total, out_dir)
+        )
+        self.thumbnail_pool.start(worker)
+
+    def _request_stop_export(self):
+        if hasattr(self, '_export_stop_event'):
+            self._export_stop_event.set()
+        self.btn_stop_export.setEnabled(False)
+        self.btn_stop_export.setText("Stopping…")
+
+    def _on_export_progress(self, done, total, workers):
+        self.lbl_file_count.setText(f"Exporting {done} / {total}  —  {workers} worker{'s' if workers != 1 else ''} active…")
+
+    def _on_export_finished(self, skipped, failed, done, total, out_dir):
+        # Restore UI
+        n = len(self.image_files)
+        self.lbl_file_count.setText(f"{n} file{'s' if n != 1 else ''} in directory")
+        self.btn_stop_export.setVisible(False)
+        self.btn_stop_export.setEnabled(True)
+        self.btn_stop_export.setText("Stop Export")
+        self.btn_export_all.setVisible(True)
+
+        cancelled = hasattr(self, '_export_stop_event') and self._export_stop_event.is_set()
+
+        lines = [f"Exported {done - len(failed)} / {total} images to:\n{out_dir}"]
+        if skipped:
+            lines.append(f"\n{len(skipped)} image(s) used default settings (never opened):")
+            lines.append("  " + ", ".join(skipped[:5]) + ("..." if len(skipped) > 5 else ""))
+        if failed:
+            lines.append(f"\n{len(failed)} image(s) failed:")
+            lines.append("\n".join(failed[:5]))
+        if cancelled:
+            lines.insert(0, "Export cancelled early.")
+        QMessageBox.information(self, "Export All — Complete", "\n".join(lines))
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
