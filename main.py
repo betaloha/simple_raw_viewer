@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QSlider, QComboBox, QCheckBox, QGraphicsView, 
                              QGraphicsScene, QGraphicsPixmapItem, QMessageBox,
-                             QDialog, QFormLayout, QStackedWidget)
+                             QDialog, QFormLayout, QStackedWidget, QSpinBox)
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QPainterPath
@@ -113,10 +113,34 @@ class GLImageView(QOpenGLWidget):
                 uniform float exposure;
                 uniform float gamma;
                 uniform vec3 wb;
+                uniform float blacks;
+                uniform float shadows;
+                uniform float highlights;
+                uniform float whites;
+                
                 void main() {
                     vec4 texColor = texture(ourTexture, TexCoord);
                     vec3 color = texColor.rgb * wb * exposure;
-                    color = clamp(color, 0.0, 1.0);
+                    
+                    // Tonal Adjustments (Smooth overlapping bell curves)
+                    for(int i=0; i<3; i++) {
+                        float x = color[i];
+                        
+                        // Use smoothstep-based bell curves for natural transitions
+                        float b_w = smoothstep(0.5, 0.0, x);
+                        float s_w = smoothstep(0.0, 0.4, x) * smoothstep(0.8, 0.4, x);
+                        float h_w = smoothstep(0.2, 0.6, x) * smoothstep(1.0, 0.6, x);
+                        float w_w = smoothstep(0.5, 1.0, x);
+                        
+                        // Apply adjustments with smoother weighting
+                        x += blacks * b_w * 0.05;
+                        x *= (1.0 + shadows * s_w * 0.5);
+                        x *= (1.0 + highlights * h_w * 0.5);
+                        x += whites * w_w * 0.05;
+                        
+                        color[i] = clamp(x, 0.0, 1.0);
+                    }
+                    
                     color = pow(color, vec3(1.0 / gamma));
                     FragColor = vec4(color, 1.0);
                 }
@@ -172,6 +196,11 @@ class GLImageView(QOpenGLWidget):
         glUniform1f(glGetUniformLocation(self.shader_program, "exposure"), self.exposure)
         glUniform1f(glGetUniformLocation(self.shader_program, "gamma"), self.gamma)
         
+        glUniform1f(glGetUniformLocation(self.shader_program, "blacks"), getattr(self, 'blacks', 0.0))
+        glUniform1f(glGetUniformLocation(self.shader_program, "shadows"), getattr(self, 'shadows', 0.0))
+        glUniform1f(glGetUniformLocation(self.shader_program, "highlights"), getattr(self, 'highlights', 0.0))
+        glUniform1f(glGetUniformLocation(self.shader_program, "whites"), getattr(self, 'whites', 0.0))
+        
         wb_loc = glGetUniformLocation(self.shader_program, "wb")
         if hasattr(self, 'wb_mults'):
             glUniform3f(wb_loc, self.wb_mults[0], self.wb_mults[1], self.wb_mults[2])
@@ -199,9 +228,16 @@ class GLImageView(QOpenGLWidget):
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, None)
         
     def wheelEvent(self, event):
+        old_zoom = self.zoom
         zoom_factor = 1.15
         if event.angleDelta().y() > 0: self.zoom *= zoom_factor
         else: self.zoom /= zoom_factor
+        
+        # Scale pan to keep the center of the screen fixed
+        ratio = self.zoom / old_zoom
+        self.pan_x *= ratio
+        self.pan_y *= ratio
+        
         self.update()
         
     def mousePressEvent(self, event):
@@ -244,6 +280,10 @@ class SettingsDialog(QDialog):
         self.cmb_mode.setCurrentIndex(parent.processing_mode)
         layout.addRow("Processing Mode:", self.cmb_mode)
         
+        self.chk_fast_preview = QCheckBox("Fast Preview (Half Size)")
+        self.chk_fast_preview.setChecked(parent.fast_preview)
+        layout.addRow("", self.chk_fast_preview)
+        
         self.btn_profile = QPushButton("Set Custom Display Profile")
         self.btn_profile.clicked.connect(self.set_custom_profile)
         
@@ -257,6 +297,12 @@ class SettingsDialog(QDialog):
         self.btn_ok = QPushButton("OK")
         self.btn_ok.clicked.connect(self.accept)
         layout.addRow("", self.btn_ok)
+        
+    def set_custom_profile(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "Select ICC Profile", "", "ICC Profiles (*.icc *.icm);;All Files (*)")
+        if file_name:
+            self.parent_editor.custom_profile_path = file_name
+            self.lbl_custom_prof.setText(os.path.basename(file_name))
 
 class ClickableLabel(QLabel):
     clicked = pyqtSignal()
@@ -343,12 +389,6 @@ class HistogramWidget(QWidget):
                 x2 = ((i+1) / 255.0) * w
                 y2 = h - min((self.hist_y[i+1] / global_max) * h, h)
                 painter.drawLine(int(x1), int(y1), int(x2), int(y2))
-        
-    def set_custom_profile(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select ICC Profile", "", "ICC Profiles (*.icc *.icm);;All Files (*)")
-        if file_name:
-            self.parent_editor.custom_profile_path = file_name
-            self.lbl_custom_prof.setText(os.path.basename(file_name))
 
 class RawEditor(QMainWindow):
     def __init__(self):
@@ -362,6 +402,7 @@ class RawEditor(QMainWindow):
         self.target_icc_path = None
         
         self.processing_mode = 3 # Default to GPU Shader Optimization
+        self.fast_preview = False
         self.linear_cache = None
         self.cache_dirty = True
         self.is_first_load = False
@@ -419,12 +460,10 @@ class RawEditor(QMainWindow):
         btn_open = QPushButton("Open RAW Image")
         btn_open.clicked.connect(self.open_image)
         control_layout.addWidget(btn_open)
-        
-        # Fast preview checkbox
-        self.chk_fast_preview = QCheckBox("Fast Preview (Half Size)")
-        self.chk_fast_preview.setChecked(True)
-        self.chk_fast_preview.stateChanged.connect(self.on_cache_invalidating_change)
-        control_layout.addWidget(self.chk_fast_preview)
+
+        btn_reset_view = QPushButton("Reset View (Zoom/Pan)")
+        btn_reset_view.clicked.connect(self.reset_viewport)
+        control_layout.addWidget(btn_reset_view)
         
         # Exposure Slider
         self.lbl_exposure = ClickableLabel("Exposure: 0.00 EV")
@@ -450,6 +489,34 @@ class RawEditor(QMainWindow):
         self.slider_gamma.valueChanged.connect(self.on_gamma_changed)
         control_layout.addWidget(self.slider_gamma)
         
+        # Tonal Controls
+        tonal_grid = QFormLayout()
+        control_layout.addLayout(tonal_grid)
+        
+        def create_tonal_slider(label_text, default_val, attr_name):
+            lbl = ClickableLabel(f"{label_text}: 0")
+            lbl.setToolTip("Click to reset")
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(-100, 100)
+            slider.setValue(default_val)
+            lbl.clicked.connect(lambda: slider.setValue(default_val))
+            
+            def on_val_changed(v):
+                lbl.setText(f"{label_text}: {v:+d}")
+                setattr(self, attr_name, v / 100.0)
+                self.update_image_deferred()
+            
+            slider.valueChanged.connect(on_val_changed)
+            tonal_grid.addRow(lbl)
+            tonal_grid.addRow(slider)
+            setattr(self, attr_name, default_val / 100.0)
+            return slider
+
+        self.slider_blacks = create_tonal_slider("Blacks", 0, "blacks")
+        self.slider_shadows = create_tonal_slider("Shadows", 0, "shadows")
+        self.slider_highlights = create_tonal_slider("Highlights", 0, "highlights")
+        self.slider_whites = create_tonal_slider("Whites", 0, "whites")
+        
         # White Balance
         control_layout.addWidget(QLabel("White Balance:"))
         self.cmb_wb = QComboBox()
@@ -457,29 +524,50 @@ class RawEditor(QMainWindow):
         self.cmb_wb.currentIndexChanged.connect(self.on_cache_invalidating_change)
         control_layout.addWidget(self.cmb_wb)
         
-        # Temperature Offset Slider
+        # Temperature Offset
         self.lbl_temp = ClickableLabel("Temp Offset: 0 K")
         self.lbl_temp.setToolTip("Click to reset")
         self.lbl_temp.clicked.connect(lambda: self.slider_temp.setValue(0))
         control_layout.addWidget(self.lbl_temp)
+        
+        temp_layout = QHBoxLayout()
         self.slider_temp = QSlider(Qt.Orientation.Horizontal)
         self.slider_temp.setMinimum(-4000)
         self.slider_temp.setMaximum(4000)
         self.slider_temp.setValue(0)
         self.slider_temp.valueChanged.connect(self.on_wb_slider_changed)
-        control_layout.addWidget(self.slider_temp)
+        temp_layout.addWidget(self.slider_temp)
+        
+        self.spin_temp = QSpinBox()
+        self.spin_temp.setRange(-4000, 4000)
+        self.spin_temp.setValue(0)
+        self.spin_temp.setSuffix(" K")
+        self.spin_temp.setFixedWidth(80)
+        self.spin_temp.valueChanged.connect(self.on_wb_spin_changed)
+        temp_layout.addWidget(self.spin_temp)
+        control_layout.addLayout(temp_layout)
 
-        # Tint Offset Slider
+        # Tint Offset
         self.lbl_tint = ClickableLabel("Tint Offset: 0")
         self.lbl_tint.setToolTip("Click to reset")
         self.lbl_tint.clicked.connect(lambda: self.slider_tint.setValue(0))
         control_layout.addWidget(self.lbl_tint)
+        
+        tint_layout = QHBoxLayout()
         self.slider_tint = QSlider(Qt.Orientation.Horizontal)
         self.slider_tint.setMinimum(-100)
         self.slider_tint.setMaximum(100)
         self.slider_tint.setValue(0)
         self.slider_tint.valueChanged.connect(self.on_wb_slider_changed)
-        control_layout.addWidget(self.slider_tint)
+        tint_layout.addWidget(self.slider_tint)
+        
+        self.spin_tint = QSpinBox()
+        self.spin_tint.setRange(-100, 100)
+        self.spin_tint.setValue(0)
+        self.spin_tint.setFixedWidth(80)
+        self.spin_tint.valueChanged.connect(self.on_wb_spin_changed)
+        tint_layout.addWidget(self.spin_tint)
+        control_layout.addLayout(tint_layout)
         
         # Output Color Space
         control_layout.addWidget(QLabel("Output Color Space:"))
@@ -541,17 +629,27 @@ class RawEditor(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load image: {str(e)}")
                 
+    def reset_viewport(self):
+        if self.processing_mode == 3:
+            self.gl_view.fit_in_view()
+        else:
+            self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            
     def open_settings(self):
         old_mode = self.processing_mode
         old_profile = self.custom_profile_path
+        old_fast_preview = self.fast_preview
         
         dlg = SettingsDialog(self)
         if dlg.exec():
             self.processing_mode = dlg.cmb_mode.currentIndex()
+            self.fast_preview = dlg.chk_fast_preview.isChecked()
             self.update_profile_label()
             
-            if old_mode != self.processing_mode or old_profile != self.custom_profile_path:
+            if old_mode != self.processing_mode or old_profile != self.custom_profile_path or old_fast_preview != self.fast_preview:
                 if self.processing_mode > 0 and self.linear_cache is None:
+                    self.cache_dirty = True
+                if old_fast_preview != self.fast_preview:
                     self.cache_dirty = True
                 self.request_update_image()
 
@@ -573,6 +671,31 @@ class RawEditor(QMainWindow):
     def on_wb_slider_changed(self):
         temp = self.slider_temp.value()
         tint = self.slider_tint.value()
+        
+        # Sync spin boxes
+        self.spin_temp.blockSignals(True)
+        self.spin_tint.blockSignals(True)
+        self.spin_temp.setValue(temp)
+        self.spin_tint.setValue(tint)
+        self.spin_temp.blockSignals(False)
+        self.spin_tint.blockSignals(False)
+        
+        self.lbl_temp.setText(f"Temp Offset: {temp:+d} K")
+        self.lbl_tint.setText(f"Tint Offset: {tint:+d}")
+        self.update_image_deferred()
+
+    def on_wb_spin_changed(self):
+        temp = self.spin_temp.value()
+        tint = self.spin_tint.value()
+        
+        # Sync sliders
+        self.slider_temp.blockSignals(True)
+        self.slider_tint.blockSignals(True)
+        self.slider_temp.setValue(temp)
+        self.slider_tint.setValue(tint)
+        self.slider_temp.blockSignals(False)
+        self.slider_tint.blockSignals(False)
+        
         self.lbl_temp.setText(f"Temp Offset: {temp:+d} K")
         self.lbl_tint.setText(f"Tint Offset: {tint:+d}")
         self.update_image_deferred()
@@ -700,6 +823,32 @@ class RawEditor(QMainWindow):
             return ImageCms.ImageCmsProfile(self.monitor_profile_path)
         return ImageCms.createProfile("sRGB")
 
+    def apply_tonal_math(self, arr):
+        # Localized tonal math for CPU paths
+        blacks = self.blacks
+        shadows = self.shadows
+        highlights = self.highlights
+        whites = self.whites
+        
+        res = arr.copy()
+        
+        # Helper for smoothstep-like behavior in numpy
+        def n_smoothstep(edge0, edge1, x):
+            t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+            return t * t * (3.0 - 2.0 * t)
+
+        b_w = n_smoothstep(0.5, 0.0, res)
+        s_w = n_smoothstep(0.0, 0.4, res) * n_smoothstep(0.8, 0.4, res)
+        h_w = n_smoothstep(0.2, 0.6, res) * n_smoothstep(1.0, 0.6, res)
+        w_w = n_smoothstep(0.5, 1.0, res)
+        
+        res += blacks * b_w * 0.05
+        res *= (1.0 + shadows * s_w * 0.5)
+        res *= (1.0 + highlights * h_w * 0.5)
+        res += whites * w_w * 0.05
+        
+        return np.clip(res, 0.0, 1.0)
+
     def process_and_display(self):
         ev = self.slider_exposure.value() / 6.0
         exposure_multiplier = 2.0 ** ev
@@ -716,7 +865,7 @@ class RawEditor(QMainWindow):
         else:
             out_cs = rawpy.ColorSpace.ProPhoto
             
-        half_size = self.chk_fast_preview.isChecked()
+        half_size = self.fast_preview
         
         # === GPU Shader Mode ===
         if self.processing_mode == 3:
@@ -749,6 +898,10 @@ class RawEditor(QMainWindow):
                 
             self.gl_view.exposure = exposure_multiplier
             self.gl_view.gamma = gamma_val
+            self.gl_view.blacks = self.blacks
+            self.gl_view.shadows = self.shadows
+            self.gl_view.highlights = self.highlights
+            self.gl_view.whites = self.whites
             self.gl_view.update()
             
             self.update_display_histogram()
@@ -798,16 +951,14 @@ class RawEditor(QMainWindow):
                 arr[:,:,1] *= off[1]
                 arr[:,:,2] *= off[2]
                 arr = arr * exposure_multiplier
-                arr = np.clip(arr, 0.0, 1.0)
+                arr = self.apply_tonal_math(arr) # <---
                 arr = np.power(arr, 1.0 / gamma_val) * 255.0
                 self.processed_rgb = arr.astype(np.uint8)
             else:
                 # LUT Optimization
-                # For LUT, we can't easily bake WB offsets if they are per-channel
-                # unless we have 3 LUTs. For now, we apply offsets to the final LUT indices.
                 lut = np.arange(65536, dtype=np.float32) / 65535.0
                 lut = lut * exposure_multiplier
-                lut = np.clip(lut, 0.0, 1.0)
+                lut = self.apply_tonal_math(lut) # <---
                 lut = np.power(lut, 1.0 / gamma_val) * 255.0
                 lut = lut.astype(np.uint8)
                 
@@ -874,7 +1025,7 @@ class RawEditor(QMainWindow):
         
         def apply_to_lut(indices, wb_idx):
             res = indices * wb_offsets[wb_idx] * exposure_multiplier
-            res = np.clip(res, 0.0, 1.0)
+            res = self.apply_tonal_math(res) # <---
             res = np.power(res, 1.0 / gamma_val) * 255.0
             return res.astype(np.uint8)
 
@@ -916,24 +1067,30 @@ class RawEditor(QMainWindow):
             else:
                 out_cs = rawpy.ColorSpace.ProPhoto
                 
-            export_rgb = self.raw_image.postprocess(
+            # Process to 16-bit linear for high-quality math
+            export_lin = self.raw_image.postprocess(
                 use_camera_wb=use_camera_wb,
                 use_auto_wb=use_auto_wb,
                 half_size=False,
                 exp_shift=exposure_multiplier,
-                gamma=(gamma_val, 4.5),
+                gamma=(1, 1),
                 output_color=out_cs,
-                output_bps=8
+                output_bps=16,
+                no_auto_bright=True
             )
             
-            # Apply WB offsets
+            # Apply WB offsets and Tonal adjustments in 16-bit space
             off = self.calculate_wb_offsets()
-            if off != [1.0, 1.0, 1.0]:
-                export_f = export_rgb.astype(np.float32)
-                export_f[:,:,0] *= off[0]
-                export_f[:,:,1] *= off[1]
-                export_f[:,:,2] *= off[2]
-                export_rgb = np.clip(export_f, 0, 255).astype(np.uint8)
+            arr = export_lin.astype(np.float32) / 65535.0
+            arr[:,:,0] *= off[0]
+            arr[:,:,1] *= off[1]
+            arr[:,:,2] *= off[2]
+            
+            arr = self.apply_tonal_math(arr)
+            
+            # Apply Gamma
+            arr = np.power(arr, 1.0 / gamma_val) * 255.0
+            export_rgb = arr.astype(np.uint8)
             
             img = Image.fromarray(export_rgb)
             
