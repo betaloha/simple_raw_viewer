@@ -6,7 +6,8 @@ import time
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QSlider, QComboBox, QCheckBox, QGraphicsView, 
-                             QGraphicsScene, QGraphicsPixmapItem, QMessageBox)
+                             QGraphicsScene, QGraphicsPixmapItem, QMessageBox,
+                             QDialog, QFormLayout)
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QPixmap, QImage
 import rawpy
@@ -53,6 +54,62 @@ def pil2pixmap(im):
     pixmap = QPixmap.fromImage(qim)
     return pixmap
 
+class ImageGraphicsView(QGraphicsView):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+
+    def wheelEvent(self, event):
+        zoom_in_factor = 1.15
+        zoom_out_factor = 1 / zoom_in_factor
+
+        if event.angleDelta().y() > 0:
+            zoom_factor = zoom_in_factor
+        else:
+            zoom_factor = zoom_out_factor
+
+        self.scale(zoom_factor, zoom_factor)
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.resize(450, 200)
+        self.parent_editor = parent
+        
+        layout = QFormLayout(self)
+        
+        self.cmb_mode = QComboBox()
+        self.cmb_mode.addItems([
+            "Full rawpy processing (Slow)", 
+            "Linear Cache Math (Medium)", 
+            "LUT Optimization (Fast)"
+        ])
+        self.cmb_mode.setCurrentIndex(parent.processing_mode)
+        layout.addRow("Processing Mode:", self.cmb_mode)
+        
+        self.btn_profile = QPushButton("Set Custom Display Profile")
+        self.btn_profile.clicked.connect(self.set_custom_profile)
+        
+        self.lbl_custom_prof = QLabel(os.path.basename(parent.custom_profile_path) if parent.custom_profile_path else "None")
+        
+        prof_layout = QHBoxLayout()
+        prof_layout.addWidget(self.btn_profile)
+        prof_layout.addWidget(self.lbl_custom_prof)
+        layout.addRow("Custom Display Profile:", prof_layout)
+        
+        self.btn_ok = QPushButton("OK")
+        self.btn_ok.clicked.connect(self.accept)
+        layout.addRow("", self.btn_ok)
+        
+    def set_custom_profile(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "Select ICC Profile", "", "ICC Profiles (*.icc *.icm);;All Files (*)")
+        if file_name:
+            self.parent_editor.custom_profile_path = file_name
+            self.lbl_custom_prof.setText(os.path.basename(file_name))
+
 class RawEditor(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -63,6 +120,11 @@ class RawEditor(QMainWindow):
         self.raw_image = None
         self.processed_rgb = None
         self.target_icc_path = None
+        
+        self.processing_mode = 2 # Default to LUT Optimization
+        self.linear_cache = None
+        self.cache_dirty = True
+        self.is_first_load = False
         
         # Color Management
         self.monitor_profile_bytes = get_x11_icc_profile()
@@ -85,7 +147,7 @@ class RawEditor(QMainWindow):
         main_layout = QHBoxLayout(central_widget)
         
         # Left Panel - Image View
-        self.view = QGraphicsView()
+        self.view = ImageGraphicsView()
         self.scene = QGraphicsScene()
         self.view.setScene(self.scene)
         self.pixmap_item = QGraphicsPixmapItem()
@@ -103,47 +165,52 @@ class RawEditor(QMainWindow):
         # Fast preview checkbox
         self.chk_fast_preview = QCheckBox("Fast Preview (Half Size)")
         self.chk_fast_preview.setChecked(True)
-        self.chk_fast_preview.stateChanged.connect(self.request_update_image)
+        self.chk_fast_preview.stateChanged.connect(self.on_cache_invalidating_change)
         control_layout.addWidget(self.chk_fast_preview)
         
-        # Brightness Slider
-        control_layout.addWidget(QLabel("Brightness (Exposure):"))
-        self.slider_brightness = QSlider(Qt.Orientation.Horizontal)
-        self.slider_brightness.setMinimum(10) # 0.1
-        self.slider_brightness.setMaximum(500) # 5.0
-        self.slider_brightness.setValue(100) # 1.0
-        self.slider_brightness.valueChanged.connect(self.update_image_deferred)
-        control_layout.addWidget(self.slider_brightness)
+        # Exposure Slider
+        self.lbl_exposure = QLabel("Exposure: 0.00 EV")
+        control_layout.addWidget(self.lbl_exposure)
+        self.slider_exposure = QSlider(Qt.Orientation.Horizontal)
+        self.slider_exposure.setMinimum(-30) # -5.0 stops
+        self.slider_exposure.setMaximum(30)  # +5.0 stops
+        self.slider_exposure.setValue(0)     # 0 stops
+        self.slider_exposure.valueChanged.connect(self.on_exposure_changed)
+        control_layout.addWidget(self.slider_exposure)
+        
+        # Gamma Slider
+        self.lbl_gamma = QLabel("Gamma: 2.22")
+        control_layout.addWidget(self.lbl_gamma)
+        self.slider_gamma = QSlider(Qt.Orientation.Horizontal)
+        self.slider_gamma.setMinimum(10) # 0.1
+        self.slider_gamma.setMaximum(500) # 5.0
+        self.slider_gamma.setValue(222) # 2.22
+        self.slider_gamma.valueChanged.connect(self.on_gamma_changed)
+        control_layout.addWidget(self.slider_gamma)
         
         # White Balance
         control_layout.addWidget(QLabel("White Balance:"))
         self.cmb_wb = QComboBox()
         self.cmb_wb.addItems(["Camera", "Auto"])
-        self.cmb_wb.currentIndexChanged.connect(self.request_update_image)
+        self.cmb_wb.currentIndexChanged.connect(self.on_cache_invalidating_change)
         control_layout.addWidget(self.cmb_wb)
         
         # Output Color Space
         control_layout.addWidget(QLabel("Output Color Space:"))
         self.cmb_colorspace = QComboBox()
         self.cmb_colorspace.addItems(["sRGB", "Adobe RGB", "ProPhoto RGB"])
-        self.cmb_colorspace.currentIndexChanged.connect(self.request_update_image)
+        self.cmb_colorspace.currentIndexChanged.connect(self.on_cache_invalidating_change)
         control_layout.addWidget(self.cmb_colorspace)
         
         # Monitor ICC Profile
-        if self.monitor_profile_bytes:
-            prof_text = "Auto-detected (X11 _ICC_PROFILE)"
-        elif self.monitor_profile_path:
-            prof_text = f"Auto-detected (colord)\n{os.path.basename(self.monitor_profile_path)}"
-        else:
-            prof_text = "None detected (Fallback to sRGB)"
-            
-        self.lbl_profile = QLabel(f"Monitor Profile:\n{prof_text}")
+        self.lbl_profile = QLabel()
         self.lbl_profile.setWordWrap(True)
+        self.update_profile_label()
         control_layout.addWidget(self.lbl_profile)
         
-        btn_custom_profile = QPushButton("Set Custom Display Profile")
-        btn_custom_profile.clicked.connect(self.set_custom_profile)
-        control_layout.addWidget(btn_custom_profile)
+        btn_settings = QPushButton("Settings")
+        btn_settings.clicked.connect(self.open_settings)
+        control_layout.addWidget(btn_settings)
         
         # Export
         control_layout.addStretch()
@@ -163,16 +230,50 @@ class RawEditor(QMainWindow):
                 if self.raw_image is not None:
                     self.raw_image.close()
                 self.raw_image = rawpy.imread(self.raw_path)
+                self.cache_dirty = True
+                self.is_first_load = True
                 self.request_update_image()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load image: {str(e)}")
                 
-    def set_custom_profile(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Select ICC Profile", "", "ICC Profiles (*.icc *.icm);;All Files (*)")
-        if file_name:
-            self.custom_profile_path = file_name
-            self.lbl_profile.setText(f"Monitor Profile:\nCustom: {os.path.basename(file_name)}")
-            self.request_update_image()
+    def open_settings(self):
+        old_mode = self.processing_mode
+        old_profile = self.custom_profile_path
+        
+        dlg = SettingsDialog(self)
+        if dlg.exec():
+            self.processing_mode = dlg.cmb_mode.currentIndex()
+            self.update_profile_label()
+            
+            if old_mode != self.processing_mode or old_profile != self.custom_profile_path:
+                if self.processing_mode > 0 and self.linear_cache is None:
+                    self.cache_dirty = True
+                self.request_update_image()
+
+    def update_profile_label(self):
+        if self.custom_profile_path:
+            text = f"Monitor Profile: Custom ({os.path.basename(self.custom_profile_path)})"
+        elif self.monitor_profile_bytes:
+            text = "Monitor Profile: Auto-detected (X11)"
+        elif self.monitor_profile_path:
+            text = f"Monitor Profile: Auto-detected ({os.path.basename(self.monitor_profile_path)})"
+        else:
+            text = "Monitor Profile: None detected (Fallback to sRGB)"
+        self.lbl_profile.setText(text)
+
+    def on_cache_invalidating_change(self):
+        self.cache_dirty = True
+        self.request_update_image()
+
+    def on_exposure_changed(self, value):
+        ev = value / 6.0
+        self.lbl_exposure.setText(f"Exposure: {ev:+.2f} EV")
+        self.update_image_deferred()
+
+    def on_gamma_changed(self, value):
+        gamma_val = value / 100.0
+        self.lbl_gamma.setText(f"Gamma: {gamma_val:.2f}")
+        self.update_image_deferred()
 
     def update_image_deferred(self):
         if self.raw_image is None:
@@ -198,11 +299,13 @@ class RawEditor(QMainWindow):
             return ImageCms.ImageCmsProfile(io.BytesIO(self.monitor_profile_bytes))
         if self.monitor_profile_path:
             return ImageCms.ImageCmsProfile(self.monitor_profile_path)
-        # Fallback to sRGB if no display profile
         return ImageCms.createProfile("sRGB")
 
     def process_and_display(self):
-        brightness = self.slider_brightness.value() / 100.0
+        ev = self.slider_exposure.value() / 6.0
+        exposure_multiplier = 2.0 ** ev
+        gamma_val = self.slider_gamma.value() / 100.0
+        
         use_auto_wb = self.cmb_wb.currentText() == "Auto"
         use_camera_wb = self.cmb_wb.currentText() == "Camera"
         
@@ -216,15 +319,46 @@ class RawEditor(QMainWindow):
             
         half_size = self.chk_fast_preview.isChecked()
         
-        # rawpy processing
-        self.processed_rgb = self.raw_image.postprocess(
-            use_camera_wb=use_camera_wb,
-            use_auto_wb=use_auto_wb,
-            half_size=half_size,
-            exp_shift=brightness,
-            output_color=out_cs,
-            output_bps=8
-        )
+        if self.processing_mode == 0:
+            # Full rawpy processing (Slow)
+            self.processed_rgb = self.raw_image.postprocess(
+                use_camera_wb=use_camera_wb,
+                use_auto_wb=use_auto_wb,
+                half_size=half_size,
+                exp_shift=exposure_multiplier,
+                gamma=(gamma_val, 4.5),
+                output_color=out_cs,
+                output_bps=8
+            )
+        else:
+            # Mode 1 or 2: use linear cache
+            if self.cache_dirty or self.linear_cache is None:
+                self.linear_cache = self.raw_image.postprocess(
+                    use_camera_wb=use_camera_wb,
+                    use_auto_wb=use_auto_wb,
+                    half_size=half_size,
+                    output_color=out_cs,
+                    output_bps=16,
+                    gamma=(1, 1),
+                    no_auto_bright=False
+                )
+                self.cache_dirty = False
+                
+            if self.processing_mode == 1:
+                # Linear Cache Math
+                arr = self.linear_cache.astype(np.float32) / 65535.0
+                arr = arr * exposure_multiplier
+                arr = np.clip(arr, 0.0, 1.0)
+                arr = np.power(arr, 1.0 / gamma_val) * 255.0
+                self.processed_rgb = arr.astype(np.uint8)
+            else:
+                # LUT Optimization
+                lut = np.arange(65536, dtype=np.float32) / 65535.0
+                lut = lut * exposure_multiplier
+                lut = np.clip(lut, 0.0, 1.0)
+                lut = np.power(lut, 1.0 / gamma_val) * 255.0
+                lut = lut.astype(np.uint8)
+                self.processed_rgb = lut[self.linear_cache]
         
         # Apply Color Management for Display
         img = Image.fromarray(self.processed_rgb)
@@ -255,9 +389,12 @@ class RawEditor(QMainWindow):
         # Convert to QPixmap and display
         pixmap = pil2pixmap(img)
         self.pixmap_item.setPixmap(pixmap)
+        self.scene.setSceneRect(self.pixmap_item.boundingRect())
         
-        # Fit in view
-        self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        # Fit in view only on first load
+        if self.is_first_load:
+            self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.is_first_load = False
 
     def export_image(self):
         if self.raw_image is None:
@@ -271,7 +408,10 @@ class RawEditor(QMainWindow):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             # Reprocess at full size
-            brightness = self.slider_brightness.value() / 100.0
+            ev = self.slider_exposure.value() / 6.0
+            exposure_multiplier = 2.0 ** ev
+            gamma_val = self.slider_gamma.value() / 100.0
+            
             use_auto_wb = self.cmb_wb.currentText() == "Auto"
             use_camera_wb = self.cmb_wb.currentText() == "Camera"
             
@@ -287,7 +427,8 @@ class RawEditor(QMainWindow):
                 use_camera_wb=use_camera_wb,
                 use_auto_wb=use_auto_wb,
                 half_size=False,
-                exp_shift=brightness,
+                exp_shift=exposure_multiplier,
+                gamma=(gamma_val, 4.5),
                 output_color=out_cs,
                 output_bps=8
             )
