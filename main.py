@@ -7,10 +7,11 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QSlider, QComboBox, QCheckBox, QGraphicsView, 
                              QGraphicsScene, QGraphicsPixmapItem, QMessageBox,
-                             QDialog, QFormLayout, QStackedWidget, QSpinBox)
+                             QDialog, QFormLayout, QStackedWidget, QSpinBox,
+                             QListWidget, QListWidgetItem, QGridLayout)
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QPainterPath
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QRunnable, QThreadPool, QObject
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QPainterPath, QIcon, QTransform
 import rawpy
 import numpy as np
 from PIL import Image, ImageCms
@@ -117,6 +118,7 @@ class GLImageView(QOpenGLWidget):
                 uniform float shadows;
                 uniform float highlights;
                 uniform float whites;
+                uniform float saturation;
                 
                 void main() {
                     vec4 texColor = texture(ourTexture, TexCoord);
@@ -140,6 +142,11 @@ class GLImageView(QOpenGLWidget):
                         
                         color[i] = clamp(x, 0.0, 1.0);
                     }
+                    
+                    // Saturation
+                    float luma = dot(color, vec3(0.299, 0.587, 0.114));
+                    color = mix(vec3(luma), color, saturation);
+                    color = clamp(color, 0.0, 1.0);
                     
                     color = pow(color, vec3(1.0 / gamma));
                     FragColor = vec4(color, 1.0);
@@ -200,6 +207,7 @@ class GLImageView(QOpenGLWidget):
         glUniform1f(glGetUniformLocation(self.shader_program, "shadows"), getattr(self, 'shadows', 0.0))
         glUniform1f(glGetUniformLocation(self.shader_program, "highlights"), getattr(self, 'highlights', 0.0))
         glUniform1f(glGetUniformLocation(self.shader_program, "whites"), getattr(self, 'whites', 0.0))
+        glUniform1f(glGetUniformLocation(self.shader_program, "saturation"), 1.0 + getattr(self, 'saturation', 0.0))
         
         wb_loc = glGetUniformLocation(self.shader_program, "wb")
         if hasattr(self, 'wb_mults'):
@@ -390,6 +398,58 @@ class HistogramWidget(QWidget):
                 y2 = h - min((self.hist_y[i+1] / global_max) * h, h)
                 painter.drawLine(int(x1), int(y1), int(x2), int(y2))
 
+def process_thumbnail_task(file_path, index):
+    import rawpy
+    from PIL import Image
+    import io
+    try:
+        with rawpy.imread(file_path) as raw:
+            try:
+                thumb = raw.extract_thumb()
+                if thumb.format == rawpy.ThumbFormat.JPEG:
+                    img = Image.open(io.BytesIO(thumb.data))
+                    flip = raw.sizes.flip
+                    if flip == 3:
+                        img = img.transpose(Image.ROTATE_180)
+                    elif flip == 5: # 90 CCW in EXIF (-90 CW)
+                        img = img.transpose(Image.ROTATE_90)
+                    elif flip == 6: # 90 CW in EXIF
+                        img = img.transpose(Image.ROTATE_270)
+                    
+                    img.thumbnail((160, 160), Image.Resampling.LANCZOS)
+                    
+                    out = io.BytesIO()
+                    img.save(out, format='JPEG')
+                    return (index, out.getvalue())
+            except rawpy.LibRawNoThumbnailError:
+                pass
+    except Exception:
+        pass
+    return (index, None)
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+class ThumbnailManagerSignals(QObject):
+    result = pyqtSignal(int, bytes)
+
+class ThumbnailManager(QRunnable):
+    def __init__(self, file_paths):
+        super().__init__()
+        self.file_paths = file_paths
+        self.signals = ThumbnailManagerSignals()
+
+    def run(self):
+        # We use a ProcessPoolExecutor to completely bypass the Python GIL
+        with ProcessPoolExecutor() as executor:
+            futures = {executor.submit(process_thumbnail_task, path, i): i for i, path in enumerate(self.file_paths)}
+            for future in as_completed(futures):
+                try:
+                    idx, data = future.result()
+                    if data:
+                        self.signals.result.emit(idx, data)
+                except Exception:
+                    pass
+
 class RawEditor(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -416,6 +476,11 @@ class RawEditor(QMainWindow):
         self.monitor_profile_path = get_colord_icc_file()
         self.custom_profile_path = None
         
+        # Threading for thumbnails
+        self.thumbnail_pool = QThreadPool()
+        # Reserve at least one core for the UI thread to prevent blocking
+        self.thumbnail_pool.setMaxThreadCount(max(1, QThreadPool.globalInstance().maxThreadCount() - 1))
+        
         # Output color spaces map to system ICC files
         self.system_icc_paths = {
             "sRGB": "/usr/share/color/icc/colord/sRGB.icc",
@@ -429,7 +494,10 @@ class RawEditor(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        main_layout = QHBoxLayout(central_widget)
+        outer_layout = QVBoxLayout(central_widget)
+        
+        main_layout = QHBoxLayout()
+        outer_layout.addLayout(main_layout, stretch=1)
         
         # View container
         self.stack = QStackedWidget()
@@ -457,13 +525,25 @@ class RawEditor(QMainWindow):
         self.histogram = HistogramWidget()
         control_layout.addWidget(self.histogram)
         
-        btn_open = QPushButton("Open RAW Image")
-        btn_open.clicked.connect(self.open_image)
-        control_layout.addWidget(btn_open)
+        # Buttons Grid
+        btn_grid = QGridLayout()
+        control_layout.addLayout(btn_grid)
+        
+        btn_open = QPushButton("Open Folder")
+        btn_open.clicked.connect(self.open_directory)
+        btn_grid.addWidget(btn_open, 0, 0)
 
-        btn_reset_view = QPushButton("Reset View (Zoom/Pan)")
+        btn_mimic = QPushButton("Auto-Match")
+        btn_mimic.clicked.connect(self.match_thumbnail)
+        btn_grid.addWidget(btn_mimic, 0, 1)
+
+        btn_reset_view = QPushButton("Reset View")
         btn_reset_view.clicked.connect(self.reset_viewport)
-        control_layout.addWidget(btn_reset_view)
+        btn_grid.addWidget(btn_reset_view, 1, 0)
+
+        btn_reset_all = QPushButton("Reset Adjustments")
+        btn_reset_all.clicked.connect(self.reset_all_settings)
+        btn_grid.addWidget(btn_reset_all, 1, 1)
         
         # Exposure Slider
         self.lbl_exposure = ClickableLabel("Exposure: 0.00 EV")
@@ -516,6 +596,7 @@ class RawEditor(QMainWindow):
         self.slider_shadows = create_tonal_slider("Shadows", 0, "shadows")
         self.slider_highlights = create_tonal_slider("Highlights", 0, "highlights")
         self.slider_whites = create_tonal_slider("Whites", 0, "whites")
+        self.slider_saturation = create_tonal_slider("Saturation", 0, "saturation")
         
         # White Balance
         control_layout.addWidget(QLabel("White Balance:"))
@@ -596,44 +677,274 @@ class RawEditor(QMainWindow):
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.request_update_image)
         
-    def open_image(self):
-        file_name, _ = QFileDialog.getOpenFileName(self, "Open RAW Image", "", "RAW Files (*.cr2 *.CR2 *.cr3 *.CR3 *.nef *.NEF *.arw *.ARW *.dng *.DNG *.pef *.PEF);;All Files (*)")
-        if file_name:
-            self.raw_path = file_name
-            try:
-                if self.raw_image is not None:
-                    self.raw_image.close()
-                self.raw_image = rawpy.imread(self.raw_path)
-                
-                color_space = "sRGB"
-                if os.path.basename(self.raw_path).startswith('_'):
-                    color_space = "Adobe RGB"
-                else:
-                    try:
-                        with open(self.raw_path, 'rb') as f:
-                            tags = exifread.process_file(f, details=False)
-                            if 'EXIF ColorSpace' in tags:
-                                val = str(tags['EXIF ColorSpace'])
-                                if 'Uncalibrated' in val or '65535' in val or 'Adobe' in val or '2' in val:
-                                    color_space = "Adobe RGB"
-                    except Exception:
-                        pass
-                
-                self.cmb_colorspace.blockSignals(True)
-                self.cmb_colorspace.setCurrentText(color_space)
-                self.cmb_colorspace.blockSignals(False)
-                
-                self.cache_dirty = True
-                self.is_first_load = True
+        # Filmstrip
+        self.filmstrip = QListWidget()
+        self.filmstrip.setViewMode(QListWidget.ViewMode.IconMode)
+        self.filmstrip.setIconSize(QSize(120, 80))
+        self.filmstrip.setFlow(QListWidget.Flow.LeftToRight)
+        self.filmstrip.setWrapping(False)
+        self.filmstrip.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.filmstrip.setFixedHeight(130)
+        self.filmstrip.setHorizontalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self.filmstrip.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.filmstrip.itemClicked.connect(self.on_thumbnail_clicked)
+        outer_layout.addWidget(self.filmstrip)
+        
+    def open_directory(self):
+        dir_name = QFileDialog.getExistingDirectory(self, "Open Directory", "")
+        if dir_name:
+            self.load_directory(dir_name)
+            
+    def match_thumbnail(self):
+        if self.raw_image is None:
+            return
+            
+        try:
+            # 1. Get Thumbnail
+            thumb = self.raw_image.extract_thumb()
+            if thumb.format != rawpy.ThumbFormat.JPEG:
+                return
+            
+            thumb_img = Image.open(io.BytesIO(thumb.data))
+            # Downsample to get average color
+            thumb_small = thumb_img.resize((32, 32), Image.Resampling.LANCZOS)
+            thumb_arr = np.array(thumb_small).astype(np.float32) / 255.0
+            
+            # Approximate linear space (thumbnail is likely sRGB)
+            thumb_lin = np.power(thumb_arr, 2.2)
+            r_tgt = np.mean(thumb_lin[:,:,0])
+            g_tgt = np.mean(thumb_lin[:,:,1])
+            b_tgt = np.mean(thumb_lin[:,:,2])
+            
+            # 2. Get Raw Linear average
+            if self.linear_cache is None:
                 self.request_update_image()
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load image: {str(e)}")
+            if self.linear_cache is None:
+                return
                 
+            raw_arr = self.linear_cache[::32, ::32, :].astype(np.float32) / 65535.0
+            r_src = np.mean(raw_arr[:,:,0])
+            g_src = np.mean(raw_arr[:,:,1])
+            b_src = np.mean(raw_arr[:,:,2])
+            
+            # 3. Compute Multipliers
+            m_r = r_tgt / max(r_src, 1e-6)
+            m_g = g_tgt / max(g_src, 1e-6)
+            m_b = b_tgt / max(b_src, 1e-6)
+            
+            # 4. Set Exposure based on Green channel
+            ev = math.log2(max(m_g, 1e-6))
+            ev = max(-5.0, min(5.0, ev))
+            self.slider_exposure.setValue(int(ev * 6))
+            
+            # 5. Set White Balance Offsets
+            res_r = m_r / max(m_g, 1e-6)
+            res_g = 1.0
+            res_b = m_b / max(m_g, 1e-6)
+            
+            r_ref, g_ref, b_ref = self.kelvin_to_rgb(6500)
+            target_r_off = r_ref / max(res_r, 1e-6)
+            target_b_off = b_ref / max(res_b, 1e-6)
+            target_ratio = target_r_off / max(target_b_off, 1e-6)
+            
+            best_dt = 0
+            min_diff = float('inf')
+            for dt in range(-4000, 4001, 20):
+                k = np.clip(6500 + dt, 2000, 12000)
+                r, g, b = self.kelvin_to_rgb(k)
+                if b == 0: continue
+                ratio = r / b
+                diff = abs(ratio - target_ratio)
+                if diff < min_diff:
+                    min_diff = diff
+                    best_dt = dt
+                    
+            r_k, g_k, b_k = self.kelvin_to_rgb(6500 + best_dt)
+            target_g_off = g_ref / max(res_g, 1e-6)
+            best_dtint = 200.0 * (1.0 - target_g_off / max(g_k, 1e-6))
+            
+            # 6. Compute Saturation Match
+            def get_chroma(arr):
+                luma = 0.299 * arr[:,:,0] + 0.587 * arr[:,:,1] + 0.114 * arr[:,:,2]
+                luma = np.maximum(luma, 1e-6)
+                chroma = np.abs(arr[:,:,0] - luma) + np.abs(arr[:,:,1] - luma) + np.abs(arr[:,:,2] - luma)
+                return np.mean(chroma / luma)
+                
+            tgt_chroma = get_chroma(thumb_lin)
+            src_chroma = get_chroma(raw_arr)
+            sat_mult = tgt_chroma / max(src_chroma, 1e-6)
+            sat_val = (sat_mult - 1.0) * 100.0
+            
+            # 7. Tone Curve Matching (Blacks, Shadows, Highlights, Whites)
+            # Apply exposure and white balance to raw array to match target luminance space
+            raw_adj = raw_arr * np.array([res_r * max(m_g, 1e-6), max(m_g, 1e-6), res_b * max(m_g, 1e-6)])
+            
+            # We match in Gamma space to optimize for the display Gamma
+            luma_tgt = 0.299 * thumb_arr[:,:,0] + 0.587 * thumb_arr[:,:,1] + 0.114 * thumb_arr[:,:,2]
+            luma_src = 0.299 * raw_adj[:,:,0] + 0.587 * raw_adj[:,:,1] + 0.114 * raw_adj[:,:,2]
+            
+            p_levels = [5, 25, 75, 95]
+            tgt_p = np.percentile(luma_tgt, p_levels)
+            src_p = np.percentile(luma_src, p_levels)
+            
+            def smoothstep(e0, e1, v):
+                t = np.clip((v - e0) / (e1 - e0), 0.0, 1.0)
+                return t * t * (3.0 - 2.0 * t)
+                
+            def eval_tonal(x, b, s, h, w, g):
+                bw = smoothstep(0.5, 0.0, x)
+                sw = smoothstep(0.0, 0.4, x) * smoothstep(0.8, 0.4, x)
+                hw = smoothstep(0.2, 0.6, x) * smoothstep(1.0, 0.6, x)
+                ww = smoothstep(0.5, 1.0, x)
+                y = np.copy(x)
+                y += b * bw * 0.05
+                y *= (1.0 + s * sw * 0.5)
+                y *= (1.0 + h * hw * 0.5)
+                y += w * ww * 0.05
+                y = np.clip(y, 1e-6, 1.0)
+                return np.power(y, 1.0 / g)
+                
+            best_p = np.array([0.0, 0.0, 0.0, 0.0, 2.22]) # b, s, h, w, g
+            lr = 5.0
+            eps = 1e-4
+            for _ in range(100):
+                curr = eval_tonal(src_p, *best_p)
+                err = curr - tgt_p
+                
+                grad = np.zeros(5)
+                for i in range(5):
+                    p_up = best_p.copy()
+                    p_up[i] += eps
+                    curr_up = eval_tonal(src_p, *p_up)
+                    dcurr_dp = (curr_up - curr) / eps
+                    grad[i] = np.sum(2 * err * dcurr_dp)
+                    
+                best_p -= lr * grad
+                # Clip b, s, h, w to [-1, 1], and gamma to [1, 5]
+                best_p[:4] = np.clip(best_p[:4], -1.0, 1.0)
+                best_p[4] = np.clip(best_p[4], 1.0, 5.0)
+
+            # Assign to sliders
+            self.slider_blacks.setValue(int(best_p[0] * 100))
+            self.slider_shadows.setValue(int(best_p[1] * 100))
+            self.slider_highlights.setValue(int(best_p[2] * 100))
+            self.slider_whites.setValue(int(best_p[3] * 100))
+            self.slider_gamma.setValue(int(best_p[4] * 100))
+            self.slider_saturation.setValue(int(np.clip(sat_val, -100, 100)))
+            
+            self.slider_temp.setValue(int(np.clip(best_dt, -4000, 4000)))
+            self.slider_tint.setValue(int(np.clip(best_dtint, -100, 100)))
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Warning", f"Could not match thumbnail: {e}")
+            
+    def load_directory(self, dir_name):
+        self.filmstrip.clear()
+        self.image_files = []
+        valid_extensions = ('.cr2', '.cr3', '.nef', '.arw', '.dng', '.pef')
+        try:
+            for f in sorted(os.listdir(dir_name)):
+                if f.lower().endswith(valid_extensions):
+                    full_path = os.path.join(dir_name, f)
+                    self.image_files.append(full_path)
+                    
+                    item = QListWidgetItem(f)
+                    self.filmstrip.addItem(item)
+                    
+            if self.image_files:
+                # We no longer load the first image automatically to save time and prevent blocking.
+                # The user will click an image in the filmstrip to start editing.
+                pass
+                
+            # Process thumbnails asynchronously using true multiprocessing
+            self.thumbnail_manager = ThumbnailManager(self.image_files)
+            self.thumbnail_manager.signals.result.connect(self.on_thumbnail_ready)
+            self.thumbnail_pool.start(self.thumbnail_manager)
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load directory: {str(e)}")
+
+    def on_thumbnail_ready(self, index, data):
+        if index < self.filmstrip.count():
+            img = QImage()
+            img.loadFromData(data)
+            item = self.filmstrip.item(index)
+            item.setIcon(QIcon(QPixmap.fromImage(img)))
+
+    def on_thumbnail_clicked(self, item):
+        row = self.filmstrip.row(item)
+        if 0 <= row < len(self.image_files):
+            self.load_image(self.image_files[row])
+
+    def load_image(self, file_path):
+        self.raw_path = file_path
+        try:
+            if self.raw_image is not None:
+                self.raw_image.close()
+            self.raw_image = rawpy.imread(self.raw_path)
+            
+            color_space = self.get_default_colorspace(self.raw_path)
+            
+            self.cmb_colorspace.blockSignals(True)
+            self.cmb_colorspace.setCurrentText(color_space)
+            self.cmb_colorspace.blockSignals(False)
+            
+            self.cache_dirty = True
+            self.is_first_load = True
+            self.request_update_image()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load image: {str(e)}")
+                
+    def get_default_colorspace(self, file_path):
+        color_space = "sRGB"
+        if os.path.basename(file_path).startswith('_'):
+            color_space = "Adobe RGB"
+        else:
+            try:
+                with open(file_path, 'rb') as f:
+                    tags = exifread.process_file(f, details=False)
+                    if 'EXIF ColorSpace' in tags:
+                        val = str(tags['EXIF ColorSpace'])
+                        if 'Uncalibrated' in val or '65535' in val or 'Adobe' in val or '2' in val:
+                            color_space = "Adobe RGB"
+            except Exception:
+                pass
+        return color_space
+
     def reset_viewport(self):
         if self.processing_mode == 3:
             self.gl_view.fit_in_view()
         else:
             self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def reset_all_settings(self):
+        # Reset dropdowns
+        self.cmb_wb.setCurrentIndex(0) # Camera
+        
+        # Restore default colorspace for the loaded image
+        if self.raw_path:
+            self.cmb_colorspace.setCurrentText(self.get_default_colorspace(self.raw_path))
+        else:
+            self.cmb_colorspace.setCurrentIndex(0) # sRGB default
+
+        # Set sliders to defaults
+        self.slider_exposure.setValue(0)
+        self.on_exposure_changed(0) # Force label update
+        
+        self.slider_gamma.setValue(222)
+        self.on_gamma_changed(222) # Force label update
+        
+        self.slider_blacks.setValue(0)
+        self.slider_shadows.setValue(0)
+        self.slider_highlights.setValue(0)
+        self.slider_whites.setValue(0)
+        self.slider_saturation.setValue(0)
+        
+        self.slider_temp.setValue(0)
+        self.slider_tint.setValue(0)
+        self.on_wb_slider_changed() # Force labels and spin boxes update
+        
+        self.request_update_image()
             
     def open_settings(self):
         old_mode = self.processing_mode
@@ -849,6 +1160,25 @@ class RawEditor(QMainWindow):
         
         return np.clip(res, 0.0, 1.0)
 
+    def apply_saturation(self, arr, sat_mult):
+        if sat_mult == 1.0:
+            return arr
+            
+        was_uint8 = False
+        if arr.dtype == np.uint8:
+            arr = arr.astype(np.float32) / 255.0
+            was_uint8 = True
+            
+        luma = 0.299 * arr[:,:,0] + 0.587 * arr[:,:,1] + 0.114 * arr[:,:,2]
+        res = np.empty_like(arr)
+        res[:,:,0] = luma + (arr[:,:,0] - luma) * sat_mult
+        res[:,:,1] = luma + (arr[:,:,1] - luma) * sat_mult
+        res[:,:,2] = luma + (arr[:,:,2] - luma) * sat_mult
+        
+        if was_uint8:
+            return np.clip(res * 255.0, 0, 255).astype(np.uint8)
+        return np.clip(res, 0.0, 1.0)
+
     def process_and_display(self):
         ev = self.slider_exposure.value() / 6.0
         exposure_multiplier = 2.0 ** ev
@@ -902,6 +1232,7 @@ class RawEditor(QMainWindow):
             self.gl_view.shadows = self.shadows
             self.gl_view.highlights = self.highlights
             self.gl_view.whites = self.whites
+            self.gl_view.saturation = getattr(self, 'saturation', 0.0)
             self.gl_view.update()
             
             self.update_display_histogram()
@@ -965,6 +1296,11 @@ class RawEditor(QMainWindow):
                 res = lut[self.linear_cache]
                 res = (res.astype(np.float32) * np.array(off)).clip(0, 255).astype(np.uint8)
                 self.processed_rgb = res
+                
+        # Saturation (CPU)
+        sat_mult = 1.0 + getattr(self, 'saturation', 0.0)
+        if sat_mult != 1.0:
+            self.processed_rgb = self.apply_saturation(self.processed_rgb, sat_mult)
         
         # Apply Color Management for Display
         img = Image.fromarray(self.processed_rgb)
@@ -1087,6 +1423,10 @@ class RawEditor(QMainWindow):
             arr[:,:,2] *= off[2]
             
             arr = self.apply_tonal_math(arr)
+            
+            sat_mult = 1.0 + getattr(self, 'saturation', 0.0)
+            if sat_mult != 1.0:
+                arr = self.apply_saturation(arr, sat_mult)
             
             # Apply Gamma
             arr = np.power(arr, 1.0 / gamma_val) * 255.0
