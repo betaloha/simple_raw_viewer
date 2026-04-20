@@ -2,6 +2,7 @@ PyQt6
 rawpy
 Pillow
 numpy
-imageio
 PyOpenGL
 exifread
+scipy
+psutil
