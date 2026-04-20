@@ -962,14 +962,14 @@ class RawEditor(QMainWindow):
         # Right Panel - Controls
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setMinimumWidth(320)
+        scroll_area.setFixedWidth(300)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         
         control_panel = QWidget()
         control_layout = QVBoxLayout(control_panel)
         
         scroll_area.setWidget(control_panel)
-        main_layout.addWidget(scroll_area, stretch=1)
+        main_layout.addWidget(scroll_area)
         
         # Histogram
         self.histogram = HistogramWidget()
@@ -2264,6 +2264,19 @@ class RawEditor(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
+    # Make labels and buttons 1 point smaller
+    font = app.font()
+    if font.pointSize() > 0:
+        font.setPointSize(max(1, font.pointSize() - 1))
+    elif font.pixelSize() > 0:
+        font.setPixelSize(max(1, font.pixelSize() - 1))
+        
+    app.setFont(font, "QLabel")
+    app.setFont(font, "QPushButton")
+    app.setFont(font, "QCheckBox")
+    app.setFont(font, "QSpinBox")
+    
     editor = RawEditor()
     editor.show()
     sys.exit(app.exec())
