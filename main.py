@@ -578,7 +578,7 @@ class BatchExportWorker(QRunnable):
         limit      = max(1, max_cap // 4)  # start at 25% of logical CPUs
 
         MEM_PERCENT_LIMIT   = 75.0
-        MEM_WINDOW_SECS     = 6.0   # rolling window to observe peak memory
+        MEM_WINDOW_SECS     = 15.0   # rolling window to observe peak memory
         MEM_SAMPLE_INTERVAL = 0.25  # background sampler interval (seconds)
         SCALE_DOWN_COOLDOWN = 2.0   # min seconds between consecutive scale-downs
         SCALE_UP_COOLDOWN   = 5.0   # min seconds between consecutive scale-ups
