@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QSlider, QComboBox, QCheckBox, QGraphicsView, 
                              QGraphicsScene, QGraphicsPixmapItem, QMessageBox,
                              QDialog, QFormLayout, QStackedWidget, QSpinBox,
-                             QListWidget, QListWidgetItem, QGridLayout)
+                             QListWidget, QListWidgetItem, QGridLayout, QScrollArea)
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QRunnable, QThreadPool, QObject
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QPainterPath, QIcon, QTransform
@@ -960,8 +960,16 @@ class RawEditor(QMainWindow):
         main_layout.addWidget(self.stack, stretch=3)
         
         # Right Panel - Controls
-        control_layout = QVBoxLayout()
-        main_layout.addLayout(control_layout, stretch=1)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMinimumWidth(320)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        control_panel = QWidget()
+        control_layout = QVBoxLayout(control_panel)
+        
+        scroll_area.setWidget(control_panel)
+        main_layout.addWidget(scroll_area, stretch=1)
         
         # Histogram
         self.histogram = HistogramWidget()
@@ -1154,7 +1162,7 @@ class RawEditor(QMainWindow):
         self.filmstrip.setFixedHeight(130)
         self.filmstrip.setHorizontalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self.filmstrip.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.filmstrip.itemClicked.connect(self.on_thumbnail_clicked)
+        self.filmstrip.currentItemChanged.connect(self.on_thumbnail_selected)
         outer_layout.addWidget(self.filmstrip)
 
         # Filmstrip footer: file count on the left, clear-settings button on the right
@@ -1350,10 +1358,13 @@ class RawEditor(QMainWindow):
             else:
                 item.setIcon(QIcon(base_pixmap))
 
-    def on_thumbnail_clicked(self, item):
-        row = self.filmstrip.row(item)
+    def on_thumbnail_selected(self, current, previous=None):
+        if current is None:
+            return
+        row = self.filmstrip.row(current)
         if 0 <= row < len(self.image_files):
-            self.load_image(self.image_files[row])
+            if self.image_files[row] != self.raw_path:
+                self.load_image(self.image_files[row])
 
     def load_image(self, file_path):
         # --- Save settings for the image we are leaving ---
