@@ -1151,6 +1151,10 @@ class RawEditor(QMainWindow):
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.request_update_image)
         
+        self.save_timer = QTimer()
+        self.save_timer.setSingleShot(True)
+        self.save_timer.timeout.connect(self._auto_save_settings)
+        
         # Filmstrip
         self.filmstrip = QListWidget()
         self.filmstrip.setViewMode(QListWidget.ViewMode.IconMode)
@@ -1366,14 +1370,16 @@ class RawEditor(QMainWindow):
             if self.image_files[row] != self.raw_path:
                 self.load_image(self.image_files[row])
 
-    def load_image(self, file_path):
-        # --- Save settings for the image we are leaving ---
+    def _auto_save_settings(self):
         if self.raw_path is not None:
             self.image_settings[self.raw_path] = self._collect_settings()
             self._save_settings_to_disk()
-            # Refresh the badge for the image we just left
             if self.raw_path in self.image_files:
                 self._refresh_badge_for_index(self.image_files.index(self.raw_path))
+
+    def load_image(self, file_path):
+        # --- Save settings for the image we are leaving ---
+        self._auto_save_settings()
 
         self.raw_path = file_path
         try:
@@ -1785,6 +1791,10 @@ class RawEditor(QMainWindow):
     def update_image_deferred(self):
         if self.raw_image is None:
             return
+            
+        # Start or restart autosave timer
+        self.save_timer.start(1000)
+        
         if self.processing_mode == 3:
             # GPU Mode can update instantly without debounce lag
             self.request_update_image()
