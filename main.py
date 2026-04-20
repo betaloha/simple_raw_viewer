@@ -112,42 +112,44 @@ class GLImageView(QOpenGLWidget):
                 out vec4 FragColor;
                 in vec2 TexCoord;
                 uniform sampler2D ourTexture;
+                uniform sampler2D toneCurveTex;
                 uniform float exposure;
                 uniform float gamma;
                 uniform vec3 wb;
-                uniform float blacks;
-                uniform float shadows;
-                uniform float highlights;
-                uniform float whites;
                 uniform float saturation;
+                uniform float hl_protect;
+                uniform sampler3D colorLutTex;
+                uniform float encodePower;
                 
                 void main() {
                     vec4 texColor = texture(ourTexture, TexCoord);
                     vec3 color = texColor.rgb * wb * exposure;
                     
-                    // Tonal Adjustments (Smooth overlapping bell curves)
-                    for(int i=0; i<3; i++) {
-                        float x = color[i];
-                        
-                        // Unified Smooth Tonal Blending
-                        // Centers: Blacks(0.0), Shadows(0.33), Highlights(0.66), Whites(1.0)
-                        float b_w = exp(-pow(x / 0.4, 2.0));
-                        float s_w = exp(-pow((x - 0.33) / 0.4, 2.0));
-                        float h_w = exp(-pow((x - 0.66) / 0.4, 2.0));
-                        float w_w = exp(-pow((x - 1.0) / 0.4, 2.0));
-                        
-                        float total_shift = (blacks * b_w) + (shadows * s_w) + (highlights * h_w) + (whites * w_w);
-                        
-                        // Apply single unified power shift
-                        color[i] = pow(clamp(x, 0.00001, 1.0), pow(2.0, -total_shift * 1.5));
+                    // Tone Curve
+                    color.r = texture(toneCurveTex, vec2(clamp(color.r, 0.0, 1.0), 0.5)).r;
+                    color.g = texture(toneCurveTex, vec2(clamp(color.g, 0.0, 1.0), 0.5)).r;
+                    color.b = texture(toneCurveTex, vec2(clamp(color.b, 0.0, 1.0), 0.5)).r;
+                    
+                    float luma = dot(color, vec3(0.299, 0.587, 0.114));
+                    
+                    if (hl_protect > 0.0) {
+                        float t = clamp((luma - 0.5) / 0.5, 0.0, 1.0);
+                        float new_luma = luma - (t * t * 0.2 * hl_protect);
+                        color = color * (new_luma / max(luma, 1e-6));
+                        luma = new_luma;
                     }
                     
                     // Saturation
-                    float luma = dot(color, vec3(0.299, 0.587, 0.114));
                     color = mix(vec3(luma), color, saturation);
+                    
                     color = clamp(color, 0.0, 1.0);
                     
-                    color = pow(color, vec3(1.0 / gamma));
+                    // Encode for 3D LUT lookup
+                    color = pow(color, vec3(encodePower));
+                    
+                    // 3D LUT transform from Source Profile to Display Profile
+                    color = texture(colorLutTex, color).rgb;
+                    
                     FragColor = vec4(color, 1.0);
                 }
             """, GL_FRAGMENT_SHADER)
@@ -184,6 +186,50 @@ class GLImageView(QOpenGLWidget):
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
         
+        self.curve_texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, self.curve_texture)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        
+        self.color_lut_texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_3D, self.color_lut_texture)
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        # Initialize default identity LUT
+        ident_lut = np.zeros((2, 2, 2, 3), dtype=np.uint8)
+        self.encode_power = 1.0
+        self.set_color_lut(ident_lut, 1.0)
+        
+        if hasattr(self, 'pending_curve'):
+            self.set_curve(self.pending_curve)
+        else:
+            self.set_curve([(0.0, 0.0), (1.0, 1.0)])
+        
+    def set_curve(self, points):
+        if not hasattr(self, 'curve_texture'):
+            self.pending_curve = points
+            return
+        self.makeCurrent()
+        dense_y = interpolate_curve(points, 256)
+        glBindTexture(GL_TEXTURE_2D, self.curve_texture)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 256, 1, 0, GL_RED, GL_FLOAT, dense_y)
+        self.update()
+
+    def set_color_lut(self, lut_data_uint8, encode_power):
+        self.makeCurrent()
+        self.encode_power = encode_power
+        glBindTexture(GL_TEXTURE_3D, self.color_lut_texture)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        lut_size = lut_data_uint8.shape[0]
+        glTexImage3D(GL_TEXTURE_3D, 0, GL_RGB8, lut_size, lut_size, lut_size, 0, GL_RGB, GL_UNSIGNED_BYTE, lut_data_uint8)
+        self.update()
+
     def set_image(self, data, w, h):
         self.image_data = data
         self.img_width = w
@@ -202,11 +248,24 @@ class GLImageView(QOpenGLWidget):
         glUniform1f(glGetUniformLocation(self.shader_program, "exposure"), self.exposure)
         glUniform1f(glGetUniformLocation(self.shader_program, "gamma"), self.gamma)
         
-        glUniform1f(glGetUniformLocation(self.shader_program, "blacks"), getattr(self, 'blacks', 0.0))
-        glUniform1f(glGetUniformLocation(self.shader_program, "shadows"), getattr(self, 'shadows', 0.0))
-        glUniform1f(glGetUniformLocation(self.shader_program, "highlights"), getattr(self, 'highlights', 0.0))
-        glUniform1f(glGetUniformLocation(self.shader_program, "whites"), getattr(self, 'whites', 0.0))
         glUniform1f(glGetUniformLocation(self.shader_program, "saturation"), 1.0 + getattr(self, 'saturation', 0.0))
+        glUniform1f(glGetUniformLocation(self.shader_program, "hl_protect"), getattr(self, 'hl_protect', 0.0))
+        
+        glUniform1f(glGetUniformLocation(self.shader_program, "encodePower"), getattr(self, 'encode_power', 1.0))
+        
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, self.texture)
+        glUniform1i(glGetUniformLocation(self.shader_program, "ourTexture"), 0)
+
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, self.curve_texture)
+        glUniform1i(glGetUniformLocation(self.shader_program, "toneCurveTex"), 1)
+        
+        glActiveTexture(GL_TEXTURE2)
+        glBindTexture(GL_TEXTURE_3D, getattr(self, 'color_lut_texture', 0))
+        glUniform1i(glGetUniformLocation(self.shader_program, "colorLutTex"), 2)
+        
+        glActiveTexture(GL_TEXTURE0)
         
         wb_loc = glGetUniformLocation(self.shader_program, "wb")
         if hasattr(self, 'wb_mults'):
@@ -397,6 +456,147 @@ class HistogramWidget(QWidget):
                 y2 = h - min((self.hist_y[i+1] / global_max) * h, h)
                 painter.drawLine(int(x1), int(y1), int(x2), int(y2))
 
+from PyQt6.QtGui import QPen
+
+def interpolate_curve(points, n_samples=256):
+    x = [p[0] for p in points]
+    y = [p[1] for p in points]
+    dense_x = np.linspace(0, 1, n_samples)
+    try:
+        from scipy.interpolate import pchip_interpolate
+        dense_y = pchip_interpolate(x, y, dense_x)
+    except ImportError:
+        dense_y = np.interp(dense_x, x, y)
+    return np.clip(dense_y, 0.0, 1.0).astype(np.float32)
+
+def apply_saturation_and_hl(arr, sat_mult, hl_protect):
+    was_uint8 = False
+    if arr.dtype == np.uint8:
+        arr = arr.astype(np.float32) / 255.0
+        was_uint8 = True
+        
+    luma = 0.299 * arr[:,:,0] + 0.587 * arr[:,:,1] + 0.114 * arr[:,:,2]
+    res = arr.copy()
+    
+    if hl_protect > 0.0:
+        t = np.clip((luma - 0.5) / 0.5, 0.0, 1.0)
+        new_luma = luma - (t * t * 0.2 * hl_protect)
+        mult = new_luma / np.maximum(luma, 1e-6)
+        res[:,:,0] *= mult
+        res[:,:,1] *= mult
+        res[:,:,2] *= mult
+        luma = new_luma
+        
+    if sat_mult != 1.0:
+        res[:,:,0] = luma + (res[:,:,0] - luma) * sat_mult
+        res[:,:,1] = luma + (res[:,:,1] - luma) * sat_mult
+        res[:,:,2] = luma + (res[:,:,2] - luma) * sat_mult
+        
+    if was_uint8:
+        return np.clip(res * 255.0, 0, 255).astype(np.uint8)
+    return np.clip(res, 0.0, 1.0)
+
+class ToneCurveWidget(QWidget):
+    changed = pyqtSignal()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(250, 200)
+        self.points = [(0.0, 0.0), (1.0, 1.0)]
+        self.active_idx = -1
+        self.drag_mode = False
+
+    def get_points(self):
+        return self.points
+
+    def set_points(self, points):
+        self.points = sorted(points, key=lambda p: p[0])
+        self.update()
+        self.changed.emit()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        
+        painter.fillRect(self.rect(), QColor(40, 40, 40))
+        painter.setPen(QColor(80, 80, 80))
+        for i in range(1, 4):
+            x = int(i * w / 4)
+            y = int(i * h / 4)
+            painter.drawLine(x, 0, x, h)
+            painter.drawLine(0, y, w, y)
+            
+        if len(self.points) > 1:
+            path = QPainterPath()
+            path.moveTo(self.points[0][0] * w, h - self.points[0][1] * h)
+            dense_x = np.linspace(0, 1, 200)
+            dense_y = interpolate_curve(self.points, 200)
+            for dx, dy in zip(dense_x, dense_y):
+                path.lineTo(dx * w, h - dy * h)
+            painter.setPen(QPen(QColor(200, 200, 200), 2))
+            painter.drawPath(path)
+            
+        painter.setBrush(QColor(150, 150, 150))
+        for i, (px, py) in enumerate(self.points):
+            if i == self.active_idx:
+                painter.setPen(QPen(QColor(255, 255, 255), 2))
+            else:
+                painter.setPen(Qt.PenStyle.NoPen)
+            cx, cy = px * w, h - py * h
+            painter.drawEllipse(int(cx - 4), int(cy - 4), 8, 8)
+
+    def mousePressEvent(self, event):
+        pos = event.pos()
+        w, h = self.width(), self.height()
+        click_x, click_y = pos.x() / w, 1.0 - pos.y() / h
+        
+        best_dist = 0.05
+        best_idx = -1
+        for i, (px, py) in enumerate(self.points):
+            dist = math.hypot(px - click_x, py - click_y)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+                
+        if best_idx != -1:
+            self.active_idx = best_idx
+            if event.button() == Qt.MouseButton.RightButton and self.active_idx not in (0, len(self.points)-1):
+                self.points.pop(self.active_idx)
+                self.active_idx = -1
+                self.changed.emit()
+            else:
+                self.drag_mode = True
+        elif event.button() == Qt.MouseButton.LeftButton:
+            self.points.append((click_x, click_y))
+            self.points.sort(key=lambda p: p[0])
+            self.active_idx = self.points.index((click_x, click_y))
+            self.drag_mode = True
+            self.changed.emit()
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.drag_mode and self.active_idx != -1:
+            pos = event.pos()
+            w, h = self.width(), self.height()
+            x, y = pos.x() / w, 1.0 - pos.y() / h
+            x = max(0.0, min(1.0, x))
+            y = max(0.0, min(1.0, y))
+            
+            if self.active_idx > 0:
+                x = max(x, self.points[self.active_idx-1][0] + 0.01)
+            if self.active_idx < len(self.points) - 1:
+                x = min(x, self.points[self.active_idx+1][0] - 0.01)
+                
+            if self.active_idx == 0: x = 0.0
+            elif self.active_idx == len(self.points) - 1: x = 1.0
+                
+            self.points[self.active_idx] = (x, y)
+            self.update()
+            self.changed.emit()
+
+    def mouseReleaseEvent(self, event):
+        self.drag_mode = False
+
 def process_thumbnail_task(file_path, index):
     import rawpy
     from PIL import Image
@@ -474,17 +674,20 @@ def _batch_export_task(args):
 
         if cs_text == 'sRGB':
             out_cs = _rawpy.ColorSpace.sRGB
+            base_gamma = 2.22
         elif cs_text == 'Adobe RGB':
             out_cs = _rawpy.ColorSpace.Adobe
+            base_gamma = 2.2
         else:
             out_cs = _rawpy.ColorSpace.ProPhoto
+            base_gamma = 1.8
 
         with _rawpy.imread(file_path) as raw:
             export_lin = raw.postprocess(
                 use_camera_wb=use_camera_wb,
                 use_auto_wb=use_auto_wb,
                 half_size=False,
-                exp_shift=exposure_mult,
+                exp_shift=1.0,
                 gamma=(1, 1),
                 output_color=out_cs,
                 output_bps=16,
@@ -500,32 +703,24 @@ def _batch_export_task(args):
 
         arr = export_lin.astype(np.float32) / 65535.0
         for ch in range(3):
-            arr[:, :, ch] *= wb[ch]
-        arr = np.clip(arr, 0.0, 1.0)
+            arr[:, :, ch] *= wb[ch] * exposure_mult
 
-        # Tonal adjustments (Gaussian power-curve, mirrors GPU shader)
-        b = settings['blacks']     / 100.0
-        s = settings['shadows']    / 100.0
-        h = settings['highlights'] / 100.0
-        w = settings['whites']     / 100.0
-        x = np.clip(arr, 1e-6, 1.0)
-        b_w = np.exp(-((x / 0.4) ** 2))
-        s_w = np.exp(-(((x - 0.33) / 0.4) ** 2))
-        h_w = np.exp(-(((x - 0.66) / 0.4) ** 2))
-        w_w = np.exp(-(((x - 1.0)  / 0.4) ** 2))
-        total_shift = b * b_w + s * s_w + h * h_w + w * w_w
-        arr = np.power(x, np.power(2.0, -total_shift * 1.5))
+        # Tonal adjustments
+        curve_points = settings.get('tone_curve', [[0.0, 0.0], [1.0, 1.0]])
+        lut = interpolate_curve(curve_points, 65536)
+        x_idx = np.clip(arr * 65535, 0, 65535).astype(np.int32)
+        arr = lut[x_idx]
 
-        # Saturation
+        # Saturation and HL
         sat_mult = 1.0 + settings['saturation'] / 100.0
-        if sat_mult != 1.0:
-            luma = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
-            for ch in range(3):
-                arr[:, :, ch] = luma + (arr[:, :, ch] - luma) * sat_mult
-            arr = np.clip(arr, 0.0, 1.0)
+        hl_protect = settings.get('hl_protect', 0) / 100.0
+        if sat_mult != 1.0 or hl_protect > 0.0:
+            arr = apply_saturation_and_hl(arr, sat_mult, hl_protect)
 
         # Gamma + quantise
-        arr = np.power(np.clip(arr, 1e-6, 1.0), 1.0 / gamma_val) * 255.0
+        creative_gamma_adjustment = 2.22 / gamma_val
+        encode_power = creative_gamma_adjustment / base_gamma
+        arr = np.power(np.clip(arr, 1e-6, 1.0), encode_power) * 255.0
         img = Image.fromarray(arr.astype(np.uint8))
 
         # ICC profile
@@ -817,14 +1012,25 @@ class RawEditor(QMainWindow):
         control_layout.addWidget(self.slider_gamma)
         
         # Tonal Controls
+        curve_label_layout = QHBoxLayout()
+        curve_label_layout.addWidget(QLabel("Tone Curve:"))
+        btn_reset_curve = QPushButton("Reset Curve")
+        btn_reset_curve.clicked.connect(lambda: self.tone_curve.set_points([(0.0, 0.0), (1.0, 1.0)]))
+        curve_label_layout.addWidget(btn_reset_curve)
+        control_layout.addLayout(curve_label_layout)
+        
+        self.tone_curve = ToneCurveWidget()
+        self.tone_curve.changed.connect(self.on_curve_changed)
+        control_layout.addWidget(self.tone_curve)
+        
         tonal_grid = QFormLayout()
         control_layout.addLayout(tonal_grid)
         
-        def create_tonal_slider(label_text, default_val, attr_name):
-            lbl = ClickableLabel(f"{label_text}: 0")
+        def create_tonal_slider(label_text, default_val, attr_name, min_v=-100, max_v=100):
+            lbl = ClickableLabel(f"{label_text}: {default_val:+d}")
             lbl.setToolTip("Click to reset")
             slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setRange(-100, 100)
+            slider.setRange(min_v, max_v)
             slider.setValue(default_val)
             lbl.clicked.connect(lambda: slider.setValue(default_val))
             
@@ -839,11 +1045,8 @@ class RawEditor(QMainWindow):
             setattr(self, attr_name, default_val / 100.0)
             return slider
 
-        self.slider_blacks = create_tonal_slider("Blacks", 0, "blacks")
-        self.slider_shadows = create_tonal_slider("Shadows", 0, "shadows")
-        self.slider_highlights = create_tonal_slider("Highlights", 0, "highlights")
-        self.slider_whites = create_tonal_slider("Whites", 0, "whites")
         self.slider_saturation = create_tonal_slider("Saturation", 0, "saturation")
+        self.slider_hl_protect = create_tonal_slider("HL Protect", 0, "hl_protect", 0, 100)
         
         # White Balance
         control_layout.addWidget(QLabel("White Balance:"))
@@ -909,6 +1112,11 @@ class RawEditor(QMainWindow):
         self.lbl_profile.setWordWrap(True)
         self.update_profile_label()
         control_layout.addWidget(self.lbl_profile)
+        
+        self.chk_disable_monitor_profile = QCheckBox("Disable Monitor Profile")
+        self.chk_disable_monitor_profile.setToolTip("Skip converting to the detected monitor ICC profile (targets sRGB instead)")
+        self.chk_disable_monitor_profile.stateChanged.connect(self.request_update_image)
+        control_layout.addWidget(self.chk_disable_monitor_profile)
         
         btn_settings = QPushButton("Settings")
         btn_settings.clicked.connect(self.open_settings)
@@ -1047,68 +1255,48 @@ class RawEditor(QMainWindow):
             sat_mult = tgt_chroma / max(src_chroma, 1e-6)
             sat_val = (sat_mult - 1.0) * 100.0
             
-            # 7. Tone Curve Matching (Blacks, Shadows, Highlights, Whites)
-            # Apply exposure and white balance to raw array to match target luminance space
+            # 7. Tone Curve Matching
             raw_adj = raw_arr * np.array([res_r * max(m_g, 1e-6), max(m_g, 1e-6), res_b * max(m_g, 1e-6)])
             
-            # We match in Gamma space to optimize for the display Gamma
-            luma_tgt = 0.299 * thumb_arr[:,:,0] + 0.587 * thumb_arr[:,:,1] + 0.114 * thumb_arr[:,:,2]
+            luma_tgt = 0.299 * thumb_lin[:,:,0] + 0.587 * thumb_lin[:,:,1] + 0.114 * thumb_lin[:,:,2]
             luma_src = 0.299 * raw_adj[:,:,0] + 0.587 * raw_adj[:,:,1] + 0.114 * raw_adj[:,:,2]
             
-            p_levels = [5, 25, 75, 95]
+            p_levels = np.linspace(5, 95, 7)
             tgt_p = np.percentile(luma_tgt, p_levels)
             src_p = np.percentile(luma_src, p_levels)
             
-            def smoothstep(e0, e1, v):
-                t = np.clip((v - e0) / (e1 - e0), 0.0, 1.0)
-                return t * t * (3.0 - 2.0 * t)
-                
-            def eval_tonal(x, b, s, h, w, g):
-                # Unified Smooth Tonal Blending weights (Gaussian-like)
-                b_w = np.exp(-((x / 0.4)**2))
-                s_w = np.exp(-(((x - 0.33) / 0.4)**2))
-                h_w = np.exp(-(((x - 0.66) / 0.4)**2))
-                w_w = np.exp(-(((x - 1.0) / 0.4)**2))
-                
-                total_shift = (b * b_w) + (s * s_w) + (h * h_w) + (w * w_w)
-                
-                y = np.clip(x, 1e-6, 1.0)
-                # Apply single unified power shift
-                y = np.power(y, np.power(2.0, -total_shift * 1.5))
-                
-                return np.power(y, 1.0 / g)
-                
-            best_p = np.array([0.0, 0.0, 0.0, 0.0, 2.22]) # b, s, h, w, g
-            initial_lr = 5.0
-            eps = 1e-4
-            num_iters = 150
-            for i in range(num_iters):
-                curr = eval_tonal(src_p, *best_p)
-                err = curr - tgt_p
-                
-                # Dynamic learning rate decay for smoother convergence
-                lr = initial_lr * (1.0 - i / float(num_iters))
-                
-                grad = np.zeros(5)
-                for j in range(5):
-                    p_up = best_p.copy()
-                    p_up[j] += eps
-                    curr_up = eval_tonal(src_p, *p_up)
-                    dcurr_dp = (curr_up - curr) / eps
-                    grad[j] = np.sum(2 * err * dcurr_dp)
+            points = [(0.0, 0.0)]
+            for s, t in zip(src_p, tgt_p):
+                s_val = float(np.clip(s, 0.01, 0.99))
+                t_val = float(np.clip(t, 0.01, 0.99))
+                # Soften the curve by blending 30% towards linear
+                t_val = 0.7 * t_val + 0.3 * s_val
+                points.append((s_val, t_val))
+            points.append((1.0, 1.0))
+            
+            filtered_points = [points[0]]
+            for p in points[1:-1]:
+                # Ensure minimum distance in X
+                if p[0] > filtered_points[-1][0] + 0.08:
+                    dx = p[0] - filtered_points[-1][0]
+                    # Constrain slope to avoid excessively steep curves
+                    new_y = np.clip(p[1], filtered_points[-1][1] + dx * 0.2, filtered_points[-1][1] + dx * 2.5)
+                    filtered_points.append((p[0], new_y))
                     
-                best_p -= lr * grad
-                # Clip parameters to valid ranges
-                best_p[:4] = np.clip(best_p[:4], -1.0, 1.0)
-                best_p[4] = np.clip(best_p[4], 1.0, 5.0)
-
-            # Assign to sliders
-            self.slider_blacks.setValue(int(best_p[0] * 100))
-            self.slider_shadows.setValue(int(best_p[1] * 100))
-            self.slider_highlights.setValue(int(best_p[2] * 100))
-            self.slider_whites.setValue(int(best_p[3] * 100))
-            self.slider_gamma.setValue(int(best_p[4] * 100))
+            if 1.0 > filtered_points[-1][0] + 0.05:
+                filtered_points.append((1.0, 1.0))
+            else:
+                filtered_points[-1] = (1.0, 1.0)
+            
+            # Auto Highlight Protect calculation
+            hl_protect_val = 0
+            if src_p[-1] > tgt_p[-1]:
+                hl_protect_val = int(np.clip((src_p[-1] - tgt_p[-1]) * 200, 0, 100))
+            
+            self.tone_curve.set_points(filtered_points)
             self.slider_saturation.setValue(int(np.clip(sat_val, -100, 100)))
+            self.slider_gamma.setValue(222)
+            self.slider_hl_protect.setValue(hl_protect_val)
             
             self.slider_temp.setValue(int(np.clip(best_dt, -4000, 4000)))
             self.slider_tint.setValue(int(np.clip(best_dtint, -100, 100)))
@@ -1235,11 +1423,9 @@ class RawEditor(QMainWindow):
         self.slider_gamma.setValue(222)
         self.on_gamma_changed(222) # Force label update
         
-        self.slider_blacks.setValue(0)
-        self.slider_shadows.setValue(0)
-        self.slider_highlights.setValue(0)
-        self.slider_whites.setValue(0)
+        self.tone_curve.set_points([(0.0, 0.0), (1.0, 1.0)])
         self.slider_saturation.setValue(0)
+        self.slider_hl_protect.setValue(0)
         
         self.slider_temp.setValue(0)
         self.slider_tint.setValue(0)
@@ -1257,11 +1443,9 @@ class RawEditor(QMainWindow):
             'colorspace': colorspace or 'sRGB',
             'exposure':   0,
             'gamma':      222,
-            'blacks':     0,
-            'shadows':    0,
-            'highlights': 0,
-            'whites':     0,
+            'tone_curve': [[0.0, 0.0], [1.0, 1.0]],
             'saturation': 0,
+            'hl_protect': 0,
             'temp':       0,
             'tint':       0,
         }
@@ -1273,11 +1457,9 @@ class RawEditor(QMainWindow):
             'colorspace': self.cmb_colorspace.currentText(),
             'exposure':   self.slider_exposure.value(),
             'gamma':      self.slider_gamma.value(),
-            'blacks':     self.slider_blacks.value(),
-            'shadows':    self.slider_shadows.value(),
-            'highlights': self.slider_highlights.value(),
-            'whites':     self.slider_whites.value(),
+            'tone_curve': self.tone_curve.get_points(),
             'saturation': self.slider_saturation.value(),
+            'hl_protect': self.slider_hl_protect.value(),
             'temp':       self.slider_temp.value(),
             'tint':       self.slider_tint.value(),
         }
@@ -1297,11 +1479,9 @@ class RawEditor(QMainWindow):
         # Sliders: let their valueChanged handlers run normally so labels update
         self.slider_exposure.setValue(s['exposure'])
         self.slider_gamma.setValue(s['gamma'])
-        self.slider_blacks.setValue(s['blacks'])
-        self.slider_shadows.setValue(s['shadows'])
-        self.slider_highlights.setValue(s['highlights'])
-        self.slider_whites.setValue(s['whites'])
+        self.tone_curve.set_points(s.get('tone_curve', [[0.0, 0.0], [1.0, 1.0]]))
         self.slider_saturation.setValue(s['saturation'])
+        self.slider_hl_protect.setValue(s.get('hl_protect', 0))
         self.slider_temp.setValue(s['temp'])
         self.slider_tint.setValue(s['tint'])
         # Sync the spin boxes (slider handlers don't always update spins)
@@ -1586,6 +1766,11 @@ class RawEditor(QMainWindow):
         self.lbl_gamma.setText(f"Gamma: {gamma_val:.2f}")
         self.update_image_deferred()
 
+    def on_curve_changed(self):
+        if self.processing_mode == 3:
+            self.gl_view.set_curve(self.tone_curve.get_points())
+        self.update_image_deferred()
+
     def update_image_deferred(self):
         if self.raw_image is None:
             return
@@ -1612,6 +1797,8 @@ class RawEditor(QMainWindow):
                 QApplication.restoreOverrideCursor()
 
     def get_display_profile(self):
+        if self.chk_disable_monitor_profile.isChecked():
+            return ImageCms.createProfile("sRGB")
         if self.custom_profile_path:
             return ImageCms.ImageCmsProfile(self.custom_profile_path)
         if self.monitor_profile_bytes:
@@ -1621,47 +1808,59 @@ class RawEditor(QMainWindow):
         return ImageCms.createProfile("sRGB")
 
     def apply_tonal_math(self, arr):
-        """Apply unified Gaussian power-curve tonal adjustments — mirrors the GPU shader exactly."""
-        b = self.blacks
-        s = self.shadows
-        h = self.highlights
-        w = self.whites
-        return self._apply_tonal_math_with(arr, b, s, h, w)
+        pts = self.tone_curve.get_points()
+        lut = interpolate_curve(pts, 65536)
+        x_idx = np.clip(arr * 65535, 0, 65535).astype(np.int32)
+        return lut[x_idx]
 
-    @staticmethod
-    def _apply_tonal_math_with(arr, b, s, h, w):
-        """Stateless version of tonal math for use in batch export."""
-        x = np.clip(arr, 1e-6, 1.0)
-        b_w = np.exp(-((x / 0.4) ** 2))
-        s_w = np.exp(-(((x - 0.33) / 0.4) ** 2))
-        h_w = np.exp(-(((x - 0.66) / 0.4) ** 2))
-        w_w = np.exp(-(((x - 1.0) / 0.4) ** 2))
-        total_shift = (b * b_w) + (s * s_w) + (h * h_w) + (w * w_w)
-        return np.power(x, np.power(2.0, -total_shift * 1.5))
-
-    def apply_saturation(self, arr, sat_mult):
-        if sat_mult == 1.0:
-            return arr
+    def update_gpu_lut(self, cs_text, gamma_val):
+        lut_key = (cs_text, self.chk_disable_monitor_profile.isChecked())
+        if not hasattr(self, '_gpu_lut_cache'):
+            self._gpu_lut_cache = {}
             
-        was_uint8 = False
-        if arr.dtype == np.uint8:
-            arr = arr.astype(np.float32) / 255.0
-            was_uint8 = True
+        if lut_key not in self._gpu_lut_cache:
+            lut_size = 33
+            target_icc_path = self.system_icc_paths.get(cs_text)
+            if target_icc_path and os.path.exists(target_icc_path):
+                source_profile = ImageCms.ImageCmsProfile(target_icc_path)
+            else:
+                source_profile = ImageCms.createProfile("sRGB")
+                
+            display_profile = self.get_display_profile()
+            try:
+                transform = ImageCms.buildTransform(source_profile, display_profile, "RGB", "RGB", ImageCms.Intent.PERCEPTUAL, 0)
+                
+                x = np.linspace(0, 255, lut_size, dtype=np.uint8)
+                z, y, x = np.meshgrid(x, x, x, indexing='ij')
+                lut_data = np.stack([x, y, z], axis=-1)
+                
+                flat_rgb = lut_data.reshape(-1, 3)
+                img = Image.fromarray(flat_rgb.reshape(-1, lut_size, 3))
+                
+                ImageCms.applyTransform(img, transform, inPlace=True)
+                self._gpu_lut_cache[lut_key] = np.array(img).reshape(lut_size, lut_size, lut_size, 3)
+            except Exception as e:
+                print("Failed to build GPU LUT:", e)
+                x = np.linspace(0, 255, lut_size, dtype=np.uint8)
+                z, y, x = np.meshgrid(x, x, x, indexing='ij')
+                self._gpu_lut_cache[lut_key] = np.stack([x, y, z], axis=-1)
             
-        luma = 0.299 * arr[:,:,0] + 0.587 * arr[:,:,1] + 0.114 * arr[:,:,2]
-        res = np.empty_like(arr)
-        res[:,:,0] = luma + (arr[:,:,0] - luma) * sat_mult
-        res[:,:,1] = luma + (arr[:,:,1] - luma) * sat_mult
-        res[:,:,2] = luma + (arr[:,:,2] - luma) * sat_mult
+        lut_data_out = self._gpu_lut_cache[lut_key]
         
-        if was_uint8:
-            return np.clip(res * 255.0, 0, 255).astype(np.uint8)
-        return np.clip(res, 0.0, 1.0)
+        if cs_text == 'sRGB': base_gamma = 2.22
+        elif cs_text == 'Adobe RGB': base_gamma = 2.2
+        else: base_gamma = 1.8
+        
+        encode_power = (2.22 / gamma_val) / base_gamma
+        self.gl_view.set_color_lut(lut_data_out, encode_power)
+
 
     def process_and_display(self):
         ev = self.slider_exposure.value() / 6.0
         exposure_multiplier = 2.0 ** ev
         gamma_val = self.slider_gamma.value() / 100.0
+        
+        off = self.calculate_wb_offsets()
         
         use_auto_wb = self.cmb_wb.currentText() == "Auto"
         use_camera_wb = self.cmb_wb.currentText() == "Camera"
@@ -1673,7 +1872,6 @@ class RawEditor(QMainWindow):
             out_cs = rawpy.ColorSpace.Adobe
         else:
             out_cs = rawpy.ColorSpace.ProPhoto
-            
         half_size = self.fast_preview
         
         # === GPU Shader Mode ===
@@ -1705,13 +1903,12 @@ class RawEditor(QMainWindow):
                 self.gl_view.fit_in_view()
                 self.is_first_load = False
                 
+            self.update_gpu_lut(cs_text, gamma_val)
             self.gl_view.exposure = exposure_multiplier
             self.gl_view.gamma = gamma_val
-            self.gl_view.blacks = self.blacks
-            self.gl_view.shadows = self.shadows
-            self.gl_view.highlights = self.highlights
-            self.gl_view.whites = self.whites
             self.gl_view.saturation = getattr(self, 'saturation', 0.0)
+            self.gl_view.hl_protect = getattr(self, 'hl_protect', 0.0)
+            self.gl_view.set_curve(self.tone_curve.get_points())
             self.gl_view.update()
             
             self.update_display_histogram()
@@ -1754,6 +1951,19 @@ class RawEditor(QMainWindow):
             # Apply WB offsets in CPU math path
             off = self.calculate_wb_offsets()
             
+            if cs_text == 'sRGB':
+                base_gamma = 2.22
+            elif cs_text == 'Adobe RGB':
+                base_gamma = 2.2
+            else:
+                base_gamma = 1.8
+                
+            creative_gamma_adjustment = 2.22 / gamma_val
+            encode_power = creative_gamma_adjustment / base_gamma
+            
+            sat_mult = 1.0 + getattr(self, 'saturation', 0.0)
+            hl_protect = getattr(self, 'hl_protect', 0.0)
+
             if self.processing_mode == 1:
                 # Linear Cache Math
                 arr = self.linear_cache.astype(np.float32) / 65535.0
@@ -1761,25 +1971,30 @@ class RawEditor(QMainWindow):
                 arr[:,:,1] *= off[1]
                 arr[:,:,2] *= off[2]
                 arr = arr * exposure_multiplier
-                arr = self.apply_tonal_math(arr) # <---
-                arr = np.power(arr, 1.0 / gamma_val) * 255.0
+                arr = self.apply_tonal_math(arr)
+                
+                if sat_mult != 1.0 or hl_protect > 0.0:
+                    arr = apply_saturation_and_hl(arr, sat_mult, hl_protect)
+                    
+                arr = np.power(np.clip(arr, 1e-6, 1.0), encode_power) * 255.0
                 self.processed_rgb = arr.astype(np.uint8)
             else:
                 # LUT Optimization
                 lut = np.arange(65536, dtype=np.float32) / 65535.0
                 lut = lut * exposure_multiplier
-                lut = self.apply_tonal_math(lut) # <---
-                lut = np.power(lut, 1.0 / gamma_val) * 255.0
-                lut = lut.astype(np.uint8)
+                lut = self.apply_tonal_math(lut)
                 
                 res = lut[self.linear_cache]
-                res = (res.astype(np.float32) * np.array(off)).clip(0, 255).astype(np.uint8)
-                self.processed_rgb = res
+                res[:,:,0] *= off[0]
+                res[:,:,1] *= off[1]
+                res[:,:,2] *= off[2]
+                res = np.clip(res, 0.0, 1.0)
                 
-        # Saturation (CPU)
-        sat_mult = 1.0 + getattr(self, 'saturation', 0.0)
-        if sat_mult != 1.0:
-            self.processed_rgb = self.apply_saturation(self.processed_rgb, sat_mult)
+                if sat_mult != 1.0 or hl_protect > 0.0:
+                    res = apply_saturation_and_hl(res, sat_mult, hl_protect)
+                    
+                res = np.power(np.clip(res, 1e-6, 1.0), encode_power) * 255.0
+                self.processed_rgb = res.astype(np.uint8)
         
         # Apply Color Management for Display
         img = Image.fromarray(self.processed_rgb)
@@ -1877,17 +2092,20 @@ class RawEditor(QMainWindow):
             cs_text = self.cmb_colorspace.currentText()
             if cs_text == "sRGB":
                 out_cs = rawpy.ColorSpace.sRGB
+                base_gamma = 2.22
             elif cs_text == "Adobe RGB":
                 out_cs = rawpy.ColorSpace.Adobe
+                base_gamma = 2.2
             else:
                 out_cs = rawpy.ColorSpace.ProPhoto
+                base_gamma = 1.8
                 
             # Process to 16-bit linear for high-quality math
             export_lin = self.raw_image.postprocess(
                 use_camera_wb=use_camera_wb,
                 use_auto_wb=use_auto_wb,
                 half_size=False,
-                exp_shift=exposure_multiplier,
+                exp_shift=1.0,
                 gamma=(1, 1),
                 output_color=out_cs,
                 output_bps=16,
@@ -1897,18 +2115,22 @@ class RawEditor(QMainWindow):
             # Apply WB offsets and Tonal adjustments in 16-bit space
             off = self.calculate_wb_offsets()
             arr = export_lin.astype(np.float32) / 65535.0
-            arr[:,:,0] *= off[0]
-            arr[:,:,1] *= off[1]
-            arr[:,:,2] *= off[2]
+            arr[:,:,0] *= off[0] * exposure_multiplier
+            arr[:,:,1] *= off[1] * exposure_multiplier
+            arr[:,:,2] *= off[2] * exposure_multiplier
             
             arr = self.apply_tonal_math(arr)
             
             sat_mult = 1.0 + getattr(self, 'saturation', 0.0)
-            if sat_mult != 1.0:
-                arr = self.apply_saturation(arr, sat_mult)
+            hl_protect = getattr(self, 'hl_protect', 0.0)
+            
+            if sat_mult != 1.0 or hl_protect > 0.0:
+                arr = apply_saturation_and_hl(arr, sat_mult, hl_protect)
             
             # Apply Gamma
-            arr = np.power(arr, 1.0 / gamma_val) * 255.0
+            creative_gamma_adjustment = 2.22 / gamma_val
+            encode_power = creative_gamma_adjustment / base_gamma
+            arr = np.power(np.clip(arr, 1e-6, 1.0), encode_power) * 255.0
             export_rgb = arr.astype(np.uint8)
             
             img = Image.fromarray(export_rgb)
