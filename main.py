@@ -95,64 +95,70 @@ class GLImageView(QOpenGLWidget):
         self.last_pos = None
 
     def initializeGL(self):
-        self.shader_program = shaders.compileProgram(
-            shaders.compileShader("""
-                #version 330 core
-                layout (location = 0) in vec2 aPos;
-                layout (location = 1) in vec2 aTexCoord;
-                out vec2 TexCoord;
-                uniform mat4 transform;
-                void main() {
-                    gl_Position = transform * vec4(aPos, 0.0, 1.0);
-                    TexCoord = aTexCoord;
-                }
-            """, GL_VERTEX_SHADER),
-            shaders.compileShader("""
-                #version 330 core
-                out vec4 FragColor;
-                in vec2 TexCoord;
-                uniform sampler2D ourTexture;
-                uniform sampler2D toneCurveTex;
-                uniform float exposure;
-                uniform float gamma;
-                uniform vec3 wb;
-                uniform float saturation;
-                uniform float hl_protect;
-                uniform sampler3D colorLutTex;
-                uniform float encodePower;
+        is_gles = self.context().isOpenGLES()
+        version_str = "#version 300 es\n" if is_gles else "#version 330 core\n"
+        frag_prec = "precision highp float;\nprecision highp sampler3D;\n" if is_gles else ""
+        
+        vert_src = version_str + """
+            layout (location = 0) in vec2 aPos;
+            layout (location = 1) in vec2 aTexCoord;
+            out vec2 TexCoord;
+            uniform mat4 transform;
+            void main() {
+                gl_Position = transform * vec4(aPos, 0.0, 1.0);
+                TexCoord = aTexCoord;
+            }
+        """
+        
+        frag_src = version_str + frag_prec + """
+            out vec4 FragColor;
+            in vec2 TexCoord;
+            uniform sampler2D ourTexture;
+            uniform sampler2D toneCurveTex;
+            uniform float exposure;
+            uniform float gamma;
+            uniform vec3 wb;
+            uniform float saturation;
+            uniform float hl_protect;
+            uniform sampler3D colorLutTex;
+            uniform float encodePower;
+            
+            void main() {
+                vec4 texColor = texture(ourTexture, TexCoord);
+                vec3 color = texColor.rgb * wb * exposure;
                 
-                void main() {
-                    vec4 texColor = texture(ourTexture, TexCoord);
-                    vec3 color = texColor.rgb * wb * exposure;
-                    
-                    // Tone Curve
-                    color.r = texture(toneCurveTex, vec2(clamp(color.r, 0.0, 1.0), 0.5)).r;
-                    color.g = texture(toneCurveTex, vec2(clamp(color.g, 0.0, 1.0), 0.5)).r;
-                    color.b = texture(toneCurveTex, vec2(clamp(color.b, 0.0, 1.0), 0.5)).r;
-                    
-                    float luma = dot(color, vec3(0.299, 0.587, 0.114));
-                    
-                    if (hl_protect > 0.0) {
-                        float t = clamp((luma - 0.5) / 0.5, 0.0, 1.0);
-                        float new_luma = luma - (t * t * 0.2 * hl_protect);
-                        color = color * (new_luma / max(luma, 1e-6));
-                        luma = new_luma;
-                    }
-                    
-                    // Saturation
-                    color = mix(vec3(luma), color, saturation);
-                    
-                    color = clamp(color, 0.0, 1.0);
-                    
-                    // Encode for 3D LUT lookup
-                    color = pow(color, vec3(encodePower));
-                    
-                    // 3D LUT transform from Source Profile to Display Profile
-                    color = texture(colorLutTex, color).rgb;
-                    
-                    FragColor = vec4(color, 1.0);
+                // Tone Curve
+                color.r = texture(toneCurveTex, vec2(clamp(color.r, 0.0, 1.0), 0.5)).r;
+                color.g = texture(toneCurveTex, vec2(clamp(color.g, 0.0, 1.0), 0.5)).r;
+                color.b = texture(toneCurveTex, vec2(clamp(color.b, 0.0, 1.0), 0.5)).r;
+                
+                float luma = dot(color, vec3(0.299, 0.587, 0.114));
+                
+                if (hl_protect > 0.0) {
+                    float t = clamp((luma - 0.5) / 0.5, 0.0, 1.0);
+                    float new_luma = luma - (t * t * 0.2 * hl_protect);
+                    color = color * (new_luma / max(luma, 1e-6));
+                    luma = new_luma;
                 }
-            """, GL_FRAGMENT_SHADER)
+                
+                // Saturation
+                color = mix(vec3(luma), color, saturation);
+                
+                color = clamp(color, 0.0, 1.0);
+                
+                // Encode for 3D LUT lookup
+                color = pow(color, vec3(encodePower));
+                
+                // 3D LUT transform from Source Profile to Display Profile
+                color = texture(colorLutTex, color).rgb;
+                
+                FragColor = vec4(color, 1.0);
+            }
+        """
+        
+        self.shader_program = shaders.compileProgram(
+            shaders.compileShader(vert_src, GL_VERTEX_SHADER),
+            shaders.compileShader(frag_src, GL_FRAGMENT_SHADER)
         )
         
         vertices = np.array([
