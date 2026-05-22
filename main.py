@@ -1461,6 +1461,14 @@ class RawEditor(QMainWindow):
         self.on_wb_slider_changed() # Force labels and spin boxes update
         
         self.request_update_image()
+        
+        # Persist defaults and clear modified badge
+        if self.raw_path:
+            self.image_settings[self.raw_path] = self._collect_settings()
+            self._set_picked_status(self.raw_path, 'unreviewed')
+            self._save_settings_to_disk()
+            if self.raw_path in self.image_files:
+                self._refresh_badge_for_index(self.image_files.index(self.raw_path))
 
     # ------------------------------------------------------------------
     # Filmstrip context menu
@@ -1545,7 +1553,7 @@ class RawEditor(QMainWindow):
             'colorspace': self.cmb_colorspace.currentText(),
             'exposure':   self.slider_exposure.value(),
             'gamma':      self.slider_gamma.value(),
-            'tone_curve': self.tone_curve.get_points(),
+            'tone_curve': [list(p) for p in self.tone_curve.get_points()],
             'saturation': self.slider_saturation.value(),
             'hl_protect': self.slider_hl_protect.value(),
             'temp':       self.slider_temp.value(),
