@@ -2080,15 +2080,28 @@ class RawEditor(QMainWindow):
         # Create a mapping from 0-65535 to 0-255
         lut_indices = np.arange(65536, dtype=np.float32) / 65535.0
         
-        def apply_to_lut(indices, wb_idx):
-            res = indices * wb_offsets[wb_idx] * exposure_multiplier
-            res = self.apply_tonal_math(res) # <---
-            res = np.power(res, 1.0 / gamma_val) * 255.0
-            return res.astype(np.uint8)
-
-        lut_r = apply_to_lut(lut_indices, 0)
-        lut_g = apply_to_lut(lut_indices, 1)
-        lut_b = apply_to_lut(lut_indices, 2)
+        # Build 3D array of shape (1, 65536, 3) representing the linear ramp with WB and exposure
+        lut = np.zeros((1, 65536, 3), dtype=np.float32)
+        lut[0, :, 0] = lut_indices * wb_offsets[0] * exposure_multiplier
+        lut[0, :, 1] = lut_indices * wb_offsets[1] * exposure_multiplier
+        lut[0, :, 2] = lut_indices * wb_offsets[2] * exposure_multiplier
+        
+        # Apply tone curve (self.apply_tonal_math can accept any-shape array)
+        lut = self.apply_tonal_math(lut)
+        
+        # Apply saturation and highlight protect
+        sat_mult = 1.0 + getattr(self, 'saturation', 0.0)
+        hl_protect = getattr(self, 'hl_protect', 0.0)
+        if sat_mult != 1.0 or hl_protect > 0.0:
+            lut = apply_saturation_and_hl(lut, sat_mult, hl_protect)
+            
+        # Apply Gamma
+        lut = np.power(np.clip(lut, 1e-6, 1.0), 1.0 / gamma_val) * 255.0
+        lut = lut.astype(np.uint8)
+        
+        lut_r = lut[0, :, 0]
+        lut_g = lut[0, :, 1]
+        lut_b = lut[0, :, 2]
         
         # Map 16-bit counts to 8-bit bins
         hist_r = np.bincount(lut_r, weights=self.counts_r, minlength=256)
