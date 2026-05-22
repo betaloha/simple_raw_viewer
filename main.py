@@ -873,6 +873,172 @@ class BatchExportWorker(QRunnable):
         self.signals.finished.emit(self.skipped, failed, done)
 
 
+def _match_thumbnail_task(args):
+    import math, numpy, rawpy, exifread, os
+    import io as _io
+    from PIL import Image
+    file_path, idx = args
+    try:
+        with rawpy.imread(file_path) as raw:
+            try:
+                thumb = raw.extract_thumb()
+                if thumb.format != rawpy.ThumbFormat.JPEG:
+                    return (idx, None)
+            except rawpy.LibRawNoThumbnailError:
+                return (idx, None)
+
+            _thumb_img = Image.open(_io.BytesIO(thumb.data))
+            _thumb_small = _thumb_img.resize((32, 32), Image.Resampling.LANCZOS)
+            _thumb_arr = numpy.array(_thumb_small).astype(numpy.float32) / 255.0
+            _thumb_lin = numpy.power(_thumb_arr, 2.2)
+            r_tgt = numpy.mean(_thumb_lin[:,:,0])
+            g_tgt = numpy.mean(_thumb_lin[:,:,1])
+            b_tgt = numpy.mean(_thumb_lin[:,:,2])
+
+            export_lin = raw.postprocess(
+                use_camera_wb=True, half_size=True,
+                output_bps=16, gamma=(1, 1), no_auto_bright=False
+            )
+            raw_arr = export_lin[::32, ::32, :].astype(numpy.float32) / 65535.0
+            r_src = numpy.mean(raw_arr[:,:,0])
+            g_src = numpy.mean(raw_arr[:,:,1])
+            b_src = numpy.mean(raw_arr[:,:,2])
+
+            m_r = r_tgt / max(r_src, 1e-6)
+            m_g = g_tgt / max(g_src, 1e-6)
+            m_b = b_tgt / max(b_src, 1e-6)
+
+            ev = math.log2(max(m_g, 1e-6))
+            ev = max(-5.0, min(5.0, ev))
+
+            res_r = m_r / max(m_g, 1e-6)
+            res_b = m_b / max(m_g, 1e-6)
+
+            def _k2r(k):
+                t = k / 100.0
+                if t <= 66:
+                    _r, _g = 255, 99.4708025861 * math.log(t) - 161.1195681661
+                    _b = 0 if t <= 19 else 138.5177312231 * math.log(t - 10) - 305.0447927307
+                else:
+                    _r = 329.698727446 * math.pow(t - 60, -0.1332047592)
+                    _g = 288.1221695283 * math.pow(t - 60, -0.0755148492)
+                    _b = 255
+                return float(numpy.clip(_r, 0, 255)), float(numpy.clip(_g, 0, 255)), float(numpy.clip(_b, 0, 255))
+
+            r_ref, g_ref, b_ref = _k2r(6500)
+            target_r_off = r_ref / max(res_r, 1e-6)
+            target_b_off = b_ref / max(res_b, 1e-6)
+            target_ratio = target_r_off / max(target_b_off, 1e-6)
+
+            best_dt, min_diff = 0, float('inf')
+            for dt in range(-4000, 4001, 20):
+                k = int(numpy.clip(6500 + dt, 2000, 12000))
+                r, g, b = _k2r(k)
+                if b == 0: continue
+                diff = abs(r / b - target_ratio)
+                if diff < min_diff:
+                    min_diff = diff
+                    best_dt = dt
+
+            r_k, g_k, b_k = _k2r(6500 + best_dt)
+            best_dtint = 200.0 * (1.0 - r_ref / max(g_k, 1e-6))
+
+            def _chroma(a):
+                lu = 0.299 * a[:,:,0] + 0.587 * a[:,:,1] + 0.114 * a[:,:,2]
+                lu = numpy.maximum(lu, 1e-6)
+                ch = numpy.abs(a[:,:,0] - lu) + numpy.abs(a[:,:,1] - lu) + numpy.abs(a[:,:,2] - lu)
+                return numpy.mean(ch / lu)
+
+            sat_val = int(numpy.clip((_chroma(_thumb_lin) / max(_chroma(raw_arr), 1e-6) - 1.0) * 100.0, -100, 100))
+
+            raw_adj = raw_arr * numpy.array([res_r * max(m_g, 1e-6), max(m_g, 1e-6), res_b * max(m_g, 1e-6)])
+            luma_tgt = 0.299 * _thumb_lin[:,:,0] + 0.587 * _thumb_lin[:,:,1] + 0.114 * _thumb_lin[:,:,2]
+            luma_src = 0.299 * raw_adj[:,:,0] + 0.587 * raw_adj[:,:,1] + 0.114 * raw_adj[:,:,2]
+            p_lvls = numpy.linspace(5, 95, 7)
+            tgt_p = numpy.percentile(luma_tgt, p_lvls)
+            src_p = numpy.percentile(luma_src, p_lvls)
+
+            filtered = [[0.0, 0.0]]
+            for s, t in zip(src_p, tgt_p):
+                sv, tv = float(numpy.clip(s, 0.01, 0.99)), float(numpy.clip(t, 0.01, 0.99))
+                tv = 0.7 * tv + 0.3 * sv
+                if sv > filtered[-1][0] + 0.08:
+                    dx = sv - filtered[-1][0]
+                    new_y = numpy.clip(tv, filtered[-1][1] + dx * 0.2, filtered[-1][1] + dx * 2.5)
+                    filtered.append([sv, new_y])
+            if 1.0 > filtered[-1][0] + 0.05:
+                filtered.append([1.0, 1.0])
+            else:
+                filtered[-1] = [1.0, 1.0]
+
+            hl = 0
+            if len(src_p) > 0 and len(tgt_p) > 0 and src_p[-1] > tgt_p[-1]:
+                hl = int(numpy.clip((src_p[-1] - tgt_p[-1]) * 200, 0, 100))
+
+            # Determine default colorspace from EXIF (same logic as get_default_colorspace)
+            cs = "sRGB"
+            if os.path.basename(file_path).startswith('_'):
+                cs = "Adobe RGB"
+            else:
+                try:
+                    with open(file_path, 'rb') as f:
+                        tags = exifread.process_file(f, details=False)
+                        if 'EXIF ColorSpace' in tags:
+                            val = str(tags['EXIF ColorSpace'])
+                            if 'Uncalibrated' in val or '65535' in val or 'Adobe' in val or '2' in val:
+                                cs = "Adobe RGB"
+                except Exception:
+                    pass
+
+            return (idx, {
+                'wb': 'Camera', 'colorspace': cs,
+                'exposure': int(ev * 6), 'gamma': 222,
+                'tone_curve': filtered, 'saturation': sat_val,
+                'hl_protect': hl,
+                'temp': int(numpy.clip(best_dt, -4000, 4000)),
+                'tint': int(numpy.clip(best_dtint, -100, 100)),
+            })
+    except Exception:
+        return (idx, None)
+
+
+class MatchAllSignals(QObject):
+    finished_signal = pyqtSignal()
+    progress_signal = pyqtSignal(int, int)
+
+
+class MatchAllWorker(QRunnable):
+    def __init__(self, file_list, stop_event, result_dict):
+        super().__init__()
+        self.file_list = file_list
+        self.stop_event = stop_event
+        self.result_dict = result_dict
+        self.signals = MatchAllSignals()
+
+    def run(self):
+        total = len(self.file_list)
+        done = 0
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            futures = {}
+            for idx, fp in enumerate(self.file_list):
+                futures[executor.submit(_match_thumbnail_task, (fp, idx))] = idx
+            for future in as_completed(futures):
+                if self.stop_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    break
+                try:
+                    idx, settings = future.result()
+                    if settings:
+                        self.result_dict[self.file_list[idx]] = settings
+                    done += 1
+                    self.signals.progress_signal.emit(done, total)
+                except Exception:
+                    done += 1
+                    self.signals.progress_signal.emit(done, total)
+        self.signals.finished_signal.emit()
+
+
 class ThumbnailManagerSignals(QObject):
     result = pyqtSignal(int, bytes)
 
@@ -1186,6 +1352,16 @@ class RawEditor(QMainWindow):
         self.lbl_file_count.setStyleSheet("color: gray; font-size: 11px;")
         filmstrip_footer.addWidget(self.lbl_file_count)
         filmstrip_footer.addStretch()
+        self.btn_pick_all = QPushButton("Pick All")
+        self.btn_pick_all.setToolTip("Mark every image in the current directory as picked")
+        self.btn_pick_all.setEnabled(False)
+        self.btn_pick_all.clicked.connect(self.pick_all_images)
+        filmstrip_footer.addWidget(self.btn_pick_all)
+        self.btn_match_all = QPushButton("Match All")
+        self.btn_match_all.setToolTip("Match camera settings for every image and save them")
+        self.btn_match_all.setEnabled(False)
+        self.btn_match_all.clicked.connect(self.match_all_images)
+        filmstrip_footer.addWidget(self.btn_match_all)
         self.btn_clear_settings = QPushButton("Clear All Saved Settings")
         self.btn_clear_settings.setToolTip("Discard persisted adjustments for every image in the current directory")
         self.btn_clear_settings.setEnabled(False)
@@ -1352,9 +1528,13 @@ class RawEditor(QMainWindow):
             total = len(self.image_files)
             if total > 0:
                 self.lbl_file_count.setText(f"{total} file{'s' if total != 1 else ''} in directory")
+                self.btn_pick_all.setEnabled(True)
+                self.btn_match_all.setEnabled(True)
                 self.btn_clear_settings.setEnabled(True)
             else:
                 self.lbl_file_count.setText("No RAW files found")
+                self.btn_pick_all.setEnabled(False)
+                self.btn_match_all.setEnabled(False)
                 self.btn_clear_settings.setEnabled(False)
 
             # Process thumbnails asynchronously using true multiprocessing
@@ -1733,6 +1913,37 @@ class RawEditor(QMainWindow):
     def _refresh_all_badges(self):
         for i in range(self.filmstrip.count()):
             self._refresh_badge_for_index(i)
+
+    # ------------------------------------------------------------------
+    # Pick all images
+    # ------------------------------------------------------------------
+    def pick_all_images(self):
+        for file_path in self.image_files:
+            self._set_picked_status(file_path, 'picked')
+
+    # ------------------------------------------------------------------
+    # Match all to camera
+    # ------------------------------------------------------------------
+    def match_all_images(self):
+        total = len(self.image_files)
+        if total == 0:
+            return
+
+        btn_text = self.btn_match_all.text()
+        self.btn_match_all.setText("Matching…")
+        self.btn_match_all.setEnabled(False)
+        self.btn_export_all.setVisible(False)
+        self.btn_stop_export.setVisible(True)
+        self.lbl_file_count.setText(f"Matching 0 / {total}…")
+
+        self._match_stop_event = threading.Event()
+        self._match_result_settings = {}
+
+        worker = MatchAllWorker(list(self.image_files), self._match_stop_event,
+                                self._match_result_settings)
+        worker.signals.finished_signal.connect(lambda: self._on_match_all_finished(total))
+        worker.signals.progress_signal.connect(self._on_match_all_progress)
+        self.thumbnail_pool.start(worker)
 
     # ------------------------------------------------------------------
     # Clear all saved settings
@@ -2407,8 +2618,36 @@ class RawEditor(QMainWindow):
     def _request_stop_export(self):
         if hasattr(self, '_export_stop_event'):
             self._export_stop_event.set()
+        if hasattr(self, '_match_stop_event'):
+            self._match_stop_event.set()
         self.btn_stop_export.setEnabled(False)
         self.btn_stop_export.setText("Stopping…")
+
+    def _on_match_all_progress(self, done, total):
+        self.lbl_file_count.setText(f"Matching {done} / {total}…")
+
+    def _on_match_all_finished(self, total):
+        cancelled = hasattr(self, '_match_stop_event') and self._match_stop_event.is_set()
+        if cancelled:
+            QMessageBox.information(self, "Match All", "Matching was cancelled.")
+            n = len(self.image_files)
+            self.lbl_file_count.setText(f"{n} file{'s' if n != 1 else ''} in directory")
+        else:
+            for fp, settings in self._match_result_settings.items():
+                if 'picked' in self._picked_map and fp in self._picked_map:
+                    settings['picked'] = self._picked_map[fp]
+                self.image_settings[fp] = settings
+            self._save_settings_to_disk()
+            self._refresh_all_badges()
+            n = len(self.image_files)
+            self.lbl_file_count.setText(f"{n} file{'s' if n != 1 else ''} in directory")
+
+        self.btn_match_all.setText("Match All")
+        self.btn_match_all.setEnabled(True)
+        self.btn_export_all.setVisible(True)
+        self.btn_stop_export.setVisible(False)
+        self.btn_stop_export.setEnabled(True)
+        self.btn_stop_export.setText("Stop Export")
 
     def _on_export_progress(self, done, total, workers):
         self.lbl_file_count.setText(f"Exporting {done} / {total}  —  {workers} worker{'s' if workers != 1 else ''} active…")
