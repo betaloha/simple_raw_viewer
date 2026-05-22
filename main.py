@@ -4,12 +4,13 @@ import subprocess
 import io
 import time
 import json
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QPushButton, QLabel, QFileDialog, 
-                             QSlider, QComboBox, QCheckBox, QGraphicsView, 
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QPushButton, QLabel, QFileDialog,
+                             QSlider, QComboBox, QCheckBox, QGraphicsView,
                              QGraphicsScene, QGraphicsPixmapItem, QMessageBox,
                              QDialog, QFormLayout, QStackedWidget, QSpinBox,
-                             QListWidget, QListWidgetItem, QGridLayout, QScrollArea)
+                             QListWidget, QListWidgetItem, QGridLayout, QScrollArea,
+                             QMenu)
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QRunnable, QThreadPool, QObject
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QPainterPath, QIcon, QTransform
@@ -912,6 +913,8 @@ class RawEditor(QMainWindow):
         
         # Per-image settings memory: maps file_path -> dict of slider/combo values
         self.image_settings = {}
+        # Per-image pick/reject status: file_path -> 'unreviewed' | 'picked' | 'rejected'
+        self._picked_map = {}
         self.current_dir = None
         self.SETTINGS_FILENAME = '.raweditor_settings.json'
         
@@ -1170,6 +1173,8 @@ class RawEditor(QMainWindow):
         self.filmstrip.setWrapping(False)
         self.filmstrip.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.filmstrip.setFixedHeight(130)
+        self.filmstrip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.filmstrip.customContextMenuRequested.connect(self._on_filmstrip_context)
         self.filmstrip.setHorizontalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self.filmstrip.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.filmstrip.currentItemChanged.connect(self.on_thumbnail_selected)
@@ -1338,6 +1343,11 @@ class RawEditor(QMainWindow):
 
             # Load persisted settings for this directory
             self.image_settings = self._load_settings_from_disk(dir_name)
+            # Restore pick/reject status from persisted settings
+            self._picked_map = {}
+            for fp, s in self.image_settings.items():
+                if isinstance(s, dict) and 'picked' in s:
+                    self._picked_map[fp] = s['picked']
 
             total = len(self.image_files)
             if total > 0:
@@ -1361,12 +1371,8 @@ class RawEditor(QMainWindow):
             img.loadFromData(data)
             base_pixmap = QPixmap.fromImage(img)
             item = self.filmstrip.item(index)
-            # Store the raw thumbnail so we can re-badge it later
             item.setData(Qt.ItemDataRole.UserRole, base_pixmap)
-            if index < len(self.image_files) and self._is_edited(self.image_files[index]):
-                item.setIcon(QIcon(self._make_badge_icon(base_pixmap)))
-            else:
-                item.setIcon(QIcon(base_pixmap))
+            self._refresh_badge_for_index(index)
 
     def on_thumbnail_selected(self, current, previous=None):
         if current is None:
@@ -1457,6 +1463,64 @@ class RawEditor(QMainWindow):
         self.request_update_image()
 
     # ------------------------------------------------------------------
+    # Filmstrip context menu
+    # ------------------------------------------------------------------
+    def _on_filmstrip_context(self, pos):
+        item = self.filmstrip.itemAt(pos)
+        if item is None:
+            return
+        row = self.filmstrip.row(item)
+        if row < 0 or row >= len(self.image_files):
+            return
+        fp = self.image_files[row]
+        menu = QMenu(self)
+        act_pick = menu.addAction("Pick")
+        act_reject = menu.addAction("Reject")
+        act_clear = menu.addAction("Clear Selection")
+        act_pick.setShortcut("P")
+        act_reject.setShortcut("R")
+        action = menu.exec(self.filmstrip.mapToGlobal(pos))
+        if action == act_pick:
+            self._set_picked_status(fp, 'picked')
+        elif action == act_reject:
+            self._set_picked_status(fp, 'rejected')
+        elif action == act_clear:
+            self._set_picked_status(fp, 'unreviewed')
+
+    # ------------------------------------------------------------------
+    # Keyboard shortcuts
+    # ------------------------------------------------------------------
+    def keyPressEvent(self, event):
+        mod = event.modifiers()
+        if (mod & Qt.KeyboardModifier.ControlModifier or
+                mod & Qt.KeyboardModifier.AltModifier or
+                mod & Qt.KeyboardModifier.MetaModifier):
+            super().keyPressEvent(event)
+            return
+        if event.key() == Qt.Key.Key_P:
+            current = self.filmstrip.currentItem()
+            if current is not None:
+                row = self.filmstrip.row(current)
+                if 0 <= row < len(self.image_files):
+                    self._set_picked_status(self.image_files[row], 'picked')
+            return
+        if event.key() == Qt.Key.Key_R:
+            current = self.filmstrip.currentItem()
+            if current is not None:
+                row = self.filmstrip.row(current)
+                if 0 <= row < len(self.image_files):
+                    self._set_picked_status(self.image_files[row], 'rejected')
+            return
+        if event.key() == Qt.Key.Key_U:
+            current = self.filmstrip.currentItem()
+            if current is not None:
+                row = self.filmstrip.row(current)
+                if 0 <= row < len(self.image_files):
+                    self._set_picked_status(self.image_files[row], 'unreviewed')
+            return
+        super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------
     # Per-image settings helpers
     # ------------------------------------------------------------------
     def _default_settings(self, colorspace=None):
@@ -1471,6 +1535,7 @@ class RawEditor(QMainWindow):
             'hl_protect': 0,
             'temp':       0,
             'tint':       0,
+            'picked':     'unreviewed',
         }
 
     def _collect_settings(self):
@@ -1485,6 +1550,7 @@ class RawEditor(QMainWindow):
             'hl_protect': self.slider_hl_protect.value(),
             'temp':       self.slider_temp.value(),
             'tint':       self.slider_tint.value(),
+            'picked':     self._get_picked_status(self.raw_path),
         }
 
     def _apply_settings(self, s):
@@ -1515,6 +1581,33 @@ class RawEditor(QMainWindow):
         self.spin_temp.blockSignals(False)
         self.spin_tint.blockSignals(False)
 
+        # Restore picked status silently (no disk write, already persisted)
+        if self.raw_path and 'picked' in s:
+            self._picked_map[self.raw_path] = s['picked']
+
+    # ------------------------------------------------------------------
+    # Picked status helpers
+    # ------------------------------------------------------------------
+    def _get_picked_status(self, file_path):
+        """Return the pick/reject status for a file. Defaults to 'unreviewed'."""
+        return getattr(self, '_picked_map', {}).get(file_path, 'unreviewed')
+
+    def _set_picked_status(self, file_path, status):
+        """Set pick status, persist to disk, refresh badge."""
+        if not hasattr(self, '_picked_map'):
+            self._picked_map = {}
+        self._picked_map[file_path] = status
+
+        # If this is the currently open image, ensure it's in settings too
+        if file_path == self.raw_path and self.raw_path:
+            current = self._collect_settings()
+            current['picked'] = status
+            self.image_settings[self.raw_path] = current
+
+        self._save_settings_to_disk()
+        if file_path in self.image_files:
+            self._refresh_badge_for_index(self.image_files.index(file_path))
+
     # ------------------------------------------------------------------
     # Persistence helpers
     # ------------------------------------------------------------------
@@ -1544,6 +1637,10 @@ class RawEditor(QMainWindow):
                 k: v for k, v in self.image_settings.items()
                 if self._is_edited(k)
             }
+            # Also persist pick/reject status for images not in image_settings
+            for fp, status in self._picked_map.items():
+                if status != 'unreviewed' and fp not in to_save:
+                    to_save[fp] = {'picked': status}
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(to_save, f, indent=2)
         except Exception:
@@ -1555,34 +1652,53 @@ class RawEditor(QMainWindow):
     def _is_edited(self, file_path):
         """Return True if the stored settings for file_path differ from defaults."""
         if file_path not in self.image_settings:
+            picked_status = self._get_picked_status(file_path)
+            if picked_status != 'unreviewed':
+                return True
             return False
         stored = self.image_settings[file_path]
         # Use the stored colorspace as the baseline (EXIF-detected default)
         defaults = self._default_settings(stored.get('colorspace', 'sRGB'))
         return stored != defaults
 
-    def _make_badge_icon(self, base_pixmap):
-        """Return a copy of base_pixmap with a small coloured edit-badge overlay."""
-        result = base_pixmap.copy()
-        painter = QPainter(result)
+    def _draw_badge(self, pixmap, x, y, size, color, glyph):
+        """Draw a circular badge with a glyph on the pixmap."""
+        painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Badge background
+        painter.setBrush(QColor(*color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(x, y, size, size)
+        painter.setPen(QColor(255, 255, 255))
+        font = painter.font()
+        font.setPixelSize(max(10, size - 6))
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(x, y, size, size, Qt.AlignmentFlag.AlignCenter, glyph)
+        painter.end()
+
+    def _make_edit_badge(self, base_pixmap):
+        """Return a copy of base_pixmap with orange edit-badge in top-right."""
+        result = base_pixmap.copy()
         badge_size = max(18, result.height() // 5)
         margin = 4
         bx = result.width() - badge_size - margin
         by = margin
-        painter.setBrush(QColor(255, 165, 0, 220))   # orange
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(bx, by, badge_size, badge_size)
-        # Pencil glyph
-        painter.setPen(QColor(255, 255, 255))
-        font = painter.font()
-        font.setPixelSize(max(10, badge_size - 6))
-        font.setBold(True)
-        painter.setFont(font)
-        painter.drawText(bx, by, badge_size, badge_size,
-                         Qt.AlignmentFlag.AlignCenter, "✎")
-        painter.end()
+        self._draw_badge(result, bx, by, badge_size, (255, 165, 0, 220), "✎")
+        return result
+
+    def _make_picked_badge(self, base_pixmap, status):
+        """Return a copy with green check (picked) or red X (rejected) in top-left."""
+        if status not in ('picked', 'rejected'):
+            return base_pixmap
+        result = base_pixmap.copy()
+        badge_size = max(18, result.height() // 5)
+        margin = 4
+        bx = margin
+        by = margin
+        if status == 'picked':
+            self._draw_badge(result, bx, by, badge_size, (0, 200, 0, 220), "✓")
+        else:
+            self._draw_badge(result, bx, by, badge_size, (200, 0, 0, 220), "✗")
         return result
 
     def _refresh_badge_for_index(self, index):
@@ -1593,10 +1709,18 @@ class RawEditor(QMainWindow):
         base_pixmap = item.data(Qt.ItemDataRole.UserRole)
         if base_pixmap is None:
             return   # thumbnail not yet loaded
-        if index < len(self.image_files) and self._is_edited(self.image_files[index]):
-            item.setIcon(QIcon(self._make_badge_icon(base_pixmap)))
-        else:
-            item.setIcon(QIcon(base_pixmap))
+        if index >= len(self.image_files):
+            return
+        fp = self.image_files[index]
+        pixmap = base_pixmap
+        # Draw pick/reject badge (top-left)
+        status = self._get_picked_status(fp)
+        if status in ('picked', 'rejected'):
+            pixmap = self._make_picked_badge(pixmap, status)
+        # Draw edit badge (top-right)
+        if self._is_edited(fp):
+            pixmap = self._make_edit_badge(pixmap)
+        item.setIcon(QIcon(pixmap))
 
     def _refresh_all_badges(self):
         for i in range(self.filmstrip.count()):
@@ -1608,14 +1732,15 @@ class RawEditor(QMainWindow):
     def clear_all_saved_settings(self):
         reply = QMessageBox.question(
             self, "Clear All Saved Settings",
-            "This will permanently discard saved adjustments for every image "
-            "in the current directory. Continue?",
+            "This will permanently discard saved adjustments and pick/reject "
+            "selections for every image in the current directory. Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
         self.image_settings.clear()
+        self._picked_map.clear()
 
         # Delete the JSON sidecar on disk
         path = self._settings_file_path()
@@ -2229,15 +2354,25 @@ class RawEditor(QMainWindow):
         if not out_dir:
             return
 
-        # Build task list
-        tasks   = []
-        skipped = []
+        # Build task list -- only export picked images
+        tasks  = []
+        rejected_basenames = []
+        unreviewed_basenames = []
+        no_settings = []
         for file_path in self.image_files:
+            status = self._get_picked_status(file_path)
+            if status != 'picked':
+                bn = os.path.basename(file_path)
+                if status == 'rejected':
+                    rejected_basenames.append(bn)
+                else:
+                    unreviewed_basenames.append(bn)
+                continue
             if file_path in self.image_settings:
                 s = self.image_settings[file_path]
             else:
                 s = self._default_settings(self.get_default_colorspace(file_path))
-                skipped.append(os.path.basename(file_path))
+                no_settings.append(os.path.basename(file_path))
             out_path = os.path.join(
                 out_dir,
                 os.path.splitext(os.path.basename(file_path))[0] + "." + ext
@@ -2245,6 +2380,8 @@ class RawEditor(QMainWindow):
             tasks.append((file_path, s, out_path, pil_fmt, self.system_icc_paths))
 
         total = len(tasks)
+        rejected = rejected_basenames
+        unreviewed = unreviewed_basenames
 
         # Show Stop button, hide Export All, show live progress
         self._export_stop_event = threading.Event()
@@ -2252,10 +2389,10 @@ class RawEditor(QMainWindow):
         self.btn_stop_export.setVisible(True)
         self.lbl_file_count.setText(f"Exporting 0 / {total}…")
 
-        worker = BatchExportWorker(tasks, skipped, self._export_stop_event)
+        worker = BatchExportWorker(tasks, no_settings, self._export_stop_event)
         worker.signals.progress.connect(self._on_export_progress)
         worker.signals.finished.connect(
-            lambda sk, fa, dn: self._on_export_finished(sk, fa, dn, total, out_dir)
+            lambda sk, fa, dn: self._on_export_finished(sk, fa, dn, total, out_dir, rejected, unreviewed)
         )
         self.thumbnail_pool.start(worker)
 
@@ -2268,7 +2405,7 @@ class RawEditor(QMainWindow):
     def _on_export_progress(self, done, total, workers):
         self.lbl_file_count.setText(f"Exporting {done} / {total}  —  {workers} worker{'s' if workers != 1 else ''} active…")
 
-    def _on_export_finished(self, skipped, failed, done, total, out_dir):
+    def _on_export_finished(self, skipped, failed, done, total, out_dir, rejected, unreviewed):
         # Restore UI
         n = len(self.image_files)
         self.lbl_file_count.setText(f"{n} file{'s' if n != 1 else ''} in directory")
@@ -2283,6 +2420,12 @@ class RawEditor(QMainWindow):
         if skipped:
             lines.append(f"\n{len(skipped)} image(s) used default settings (never opened):")
             lines.append("  " + ", ".join(skipped[:5]) + ("..." if len(skipped) > 5 else ""))
+        if rejected:
+            lines.append(f"\n{len(rejected)} image(s) rejected (not exported):")
+            lines.append("  " + ", ".join(rejected[:5]) + ("..." if len(rejected) > 5 else ""))
+        if unreviewed:
+            lines.append(f"\n{len(unreviewed)} image(s) unreviewed (not exported):")
+            lines.append("  " + ", ".join(unreviewed[:5]) + ("..." if len(unreviewed) > 5 else ""))
         if failed:
             lines.append(f"\n{len(failed)} image(s) failed:")
             lines.append("\n".join(failed[:5]))
